@@ -1,2 +1,2 @@
 # abstraction
-Abstraction in ANN's
+Abstraction in ANNs
