@@ -4,17 +4,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 
-import numpy as np 
+try:
+    from torch.hub import load_state_dict_from_url
+except ImportError:
+    from torch.utils.model_zoo import load_url as load_state_dict_from_url
 
+import numpy as np 
 import math
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 __all__ = [
     "cnn5", 'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn',
-    'vgg19_bn', 'vgg19_bn_4','vgg19_bn_8','vgg19_bn_16','vgg19_bn_32',
+    'vgg19_bn', 'vgg19_bn_lb', 'vgg19_bn_4','vgg19_bn_8','vgg19_bn_16','vgg19_bn_32',
     'vgg19', 'vgg19_4','vgg19_8','vgg19_16','vgg19_32',
-    'resnet18k_4','resnet18k_8','resnet18k_16','resnet18k_32','resnet18k_64',
+    'resnet18k_4','resnet18k_8','resnet18k_16','resnet18k_32','resnet18preAct',
     'resnet18', 'resnet34', 'resnet50', 'resnet101'
 ]
 
@@ -75,14 +79,14 @@ def make_cnn(c=64):
         nn.MaxPool2d(4),
         Flatten(),
         nn.Linear(c*8, 10, bias=True)
-
     )
+
 
 class VGG(nn.Module):
     '''
     VGG model
     '''
-    def __init__(self, features, width=64):
+    def __init__(self, features, width=64, num_classes=10):
         super(VGG, self).__init__()
         self.features = features
         self.width = int(512 * (width/64.0))
@@ -93,7 +97,7 @@ class VGG(nn.Module):
             nn.Dropout(),
             nn.Linear(self.width, self.width),
             nn.ReLU(True),
-            nn.Linear(self.width, 10),
+            nn.Linear(self.width, num_classes),
         )
          # Initialize weights
         for m in self.modules():
@@ -101,23 +105,6 @@ class VGG(nn.Module):
                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
                 m.weight.data.normal_(0, math.sqrt(2. / n))
                 m.bias.data.zero_()
-
-        '''
-        # Save initial wegihts in buffers
-        for name, param in self.named_parameters():
-            if name.split(".")[-1] == "bias" or (len(param.size()) == 1 and name.split(".")[0] == "features"):
-                continue
-
-            #buffer_key = None
-            #splt = name.split(".")
-            #if splt[0] == "classifier":
-            buffer_key = name.replace(".", "_")
-            #else:
-            #    buffer_key = "_".join(splt[:1] + splt[2:])
-
-            self.register_buffer(buffer_key, param.detach().cpu())
-            #print("buffer {0} is registered".format(buffer_key))
-        '''
 
     def forward(self, x,):
         x = self.features(x)
@@ -129,14 +116,7 @@ class VGG(nn.Module):
         for name, param in self.named_parameters():
             if name.split(".")[-1] == "bias" or (len(param.size()) == 1 and name.split(".")[0] == "features"):
                 continue
-
-            #buffer_key = None
-            #splt = name.split(".")
-            #if splt[0] == "classifier":
             buffer_key = name.replace(".", "_")
-            #else:
-            #    buffer_key = "_".join(splt[:1] + splt[2:])
-
             self._buffers[buffer_key] = param.detach().cpu()
 
 
@@ -151,14 +131,8 @@ class VGG(nn.Module):
             if (name.split(".")[-1] == "bias") or (len(param.size()) == 1 and name.split(".")[0] == "features"):
                 continue
 
-            #buffer_key = None
-            #splt = name.split(".")
-            #if splt[0] == "classifier":
             buffer_key = name.replace(".", "_")
-            #else:
-            #    buffer_key = "_".join(splt[:1] + splt[2:])
 
-            #print(self._buffers[buffer_key].size(), param.size())
             initial_version = self._buffers[buffer_key].view(-1, np.prod(list(param.size())) )
             param_flattened = param.detach().view(-1, np.prod( list(param.size())))
             distance = 1 - F.cosine_similarity(param_flattened, initial_version.to(device))
@@ -195,84 +169,88 @@ def cnn5(c=5):
     """5 layer CNN model (identical with model from Double descent paper.)"""
     return CNN5(make_cnn(c))
 
-def vgg11():
+def vgg11(num_classes):
     """VGG 11-layer model (configuration "A")"""
-    return VGG(make_layers(cfg['A']))
+    return VGG(make_layers(cfg['A']), num_classes=num_classes)
 
 
-def vgg11_bn():
+def vgg11_bn(num_classes):
     """VGG 11-layer model (configuration "A") with batch normalization"""
-    return VGG(make_layers(cfg['A'], batch_norm=True))
+    return VGG(make_layers(cfg['A'], batch_norm=True), num_classes=num_classes)
 
 
-def vgg13():
+def vgg13(num_classes):
     """VGG 13-layer model (configuration "B")"""
-    return VGG(make_layers(cfg['B']))
+    return VGG(make_layers(cfg['B']), num_classes=num_classes)
 
 
-def vgg13_bn():
+def vgg13_bn(num_classes):
     """VGG 13-layer model (configuration "B") with batch normalization"""
-    return VGG(make_layers(cfg['B'], batch_norm=True))
+    return VGG(make_layers(cfg['B'], batch_norm=True), num_classes=num_classes)
 
 
-def vgg16():
+def vgg16(num_classes):
     """VGG 16-layer model (configuration "D")"""
-    return VGG(make_layers(cfg['D']))
+    return VGG(make_layers(cfg['D']), num_classes=num_classes)
 
 
-def vgg16_bn():
+def vgg16_bn(num_classes):
     """VGG 16-layer model (configuration "D") with batch normalization"""
-    return VGG(make_layers(cfg['D'], batch_norm=True))
+    return VGG(make_layers(cfg['D'], batch_norm=True), num_classes=num_classes)
 
 
-def vgg19():
+def vgg19(num_classes):
     """VGG 19-layer model (configuration "E")"""
-    return VGG(make_layers(cfg['E']))
+    return VGG(make_layers(cfg['E']), num_classes=num_classes)
 
-def vgg19_4():
+def vgg19_4(num_classes):
     """VGG 19-layer model (configuration 'E')"""
-    return VGG(make_layers(cfg['E'], width=4),width=4)
+    return VGG(make_layers(cfg['E'], width=4),width=4, num_classes=num_classes)
 
 
-def vgg19_8():
+def vgg19_8(num_classes):
     """VGG 19-layer model (configuration 'E')"""
-    return VGG(make_layers(cfg['E'], width=8),width=8)
+    return VGG(make_layers(cfg['E'], width=8),width=8, num_classes=num_classes)
 
 
-def vgg19_16():
+def vgg19_16(num_classes):
     """VGG 19-layer model (configuration 'E')"""
-    return VGG(make_layers(cfg['E'], width=16),width=16)
+    return VGG(make_layers(cfg['E'], width=16),width=16, num_classes=num_classes)
 
 
-def vgg19_32():
+def vgg19_32(num_classes):
     """VGG 19-layer model (configuration 'E')"""
-    return VGG(make_layers(cfg['E'], width=32),width=32)
+    return VGG(make_layers(cfg['E'], width=32),width=32, num_classes=num_classes)
 
 
 
-def vgg19_bn():
+def vgg19_bn(num_classes):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
-    return VGG(make_layers(cfg['E'], batch_norm=True))
+    return VGG(make_layers(cfg['E'], batch_norm=True), num_classes=num_classes)
 
-
-def vgg19_bn_4():
+def vgg19_bn_lb(num_classes):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
-    return VGG(make_layers(cfg['E'], batch_norm=True, width=4),width=4)
+    return VGG(make_layers(cfg['E'], batch_norm=True), num_classes=num_classes)
 
 
-def vgg19_bn_8():
+def vgg19_bn_4(num_classes):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
-    return VGG(make_layers(cfg['E'], batch_norm=True, width=8),width=8)
+    return VGG(make_layers(cfg['E'], batch_norm=True, width=4),width=4, num_classes=num_classes)
 
 
-def vgg19_bn_16():
+def vgg19_bn_8(num_classes):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
-    return VGG(make_layers(cfg['E'], batch_norm=True, width=16),width=16)
+    return VGG(make_layers(cfg['E'], batch_norm=True, width=8),width=8, num_classes=num_classes)
 
 
-def vgg19_bn_32():
+def vgg19_bn_16(num_classes):
     """VGG 19-layer model (configuration 'E') with batch normalization"""
-    return VGG(make_layers(cfg['E'], batch_norm=True, width=32),width=32)
+    return VGG(make_layers(cfg['E'], batch_norm=True, width=16),width=16, num_classes=num_classes)
+
+
+def vgg19_bn_32(num_classes):
+    """VGG 19-layer model (configuration 'E') with batch normalization"""
+    return VGG(make_layers(cfg['E'], batch_norm=True, width=32),width=32, num_classes=num_classes)
 
 
 
@@ -315,11 +293,11 @@ class PreActBlock(nn.Module):
         return out
 
 class PreActResNet(nn.Module):
-    def __init__(self, block, num_blocks,  init_channels=64):
+    def __init__(self, block, num_blocks,  init_channels=64, num_classes = 10):
         super(PreActResNet, self).__init__()
         self.in_planes = init_channels
         c = init_channels
-        num_classes = 10
+        
 
         self.conv1 = nn.Conv2d(3, c, kernel_size=3,
                                stride=1, padding=1, bias=False)
@@ -379,8 +357,7 @@ class PreActResNet(nn.Module):
         distances = []
         for name, param in self.named_parameters():
             if "conv" in name or "fc.weight" in name:
-                #buffer_key = None
-                #splt = name.split(".")
+
                 buffer_key = name.replace(".", "_") #"_".join(splt[:3])
 
                 initial_version = self._buffers[buffer_key].view(-1, np.prod(list(param.size())) ).to(device)
@@ -541,7 +518,6 @@ class ResNet(nn.Module):
                 buffer_key = name.replace(".", "_") #"_".join(splt[:3])
                 self._buffers[buffer_key] = param.detach().cpu()
 
-
     def get_cosine_distance_per_layer(self):
         param_keys = []
         distances = []
@@ -618,27 +594,27 @@ def _resnet(arch, block, layers, pretrained, progress, **kwargs):
                                               progress=progress)
         model.load_state_dict(state_dict)
     return model
+    
 
-
-def resnet18k_4() -> PreActResNet:
+def resnet18k_4(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=4)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=4, num_classes=num_classes)
 
-def resnet18k_8() -> PreActResNet:
+def resnet18k_8(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=8)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=8, num_classes=num_classes)
 
-def resnet18k_16() -> PreActResNet:
+def resnet18k_16(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=16)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=16, num_classes=num_classes)
 
-def resnet18k_32() -> PreActResNet:
+def resnet18k_32(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=32)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=32, num_classes=num_classes)
 
-def resnet18k_64() -> PreActResNet:
+def resnet18preact(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=64)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=64, num_classes=num_classes)
 
 def resnet18(pretrained=False, progress=True, **kwargs):
     r"""ResNet-18 model from
@@ -651,7 +627,6 @@ def resnet18(pretrained=False, progress=True, **kwargs):
     return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress,
                    **kwargs)
 
-
 def resnet34(pretrained=False, progress=True, **kwargs):
     r"""ResNet-34 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
@@ -662,7 +637,6 @@ def resnet34(pretrained=False, progress=True, **kwargs):
     """
     return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], pretrained, progress,
                    **kwargs)
-
 
 def resnet50(pretrained=False, progress=True, **kwargs):
     r"""ResNet-50 model from

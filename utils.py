@@ -40,20 +40,33 @@ class EarlyStopping:
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
+    def __init__(self, initial=0, keep_val=True):
+        self.keep_val = keep_val
+        self.reset(initial)
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
+    def reset(self, initial = 0):
+        if self.keep_val:
+            self.val = initial    
+        else:
+            self.val = 0
+        self.avg = initial
         self.count = 0
 
     def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
+        if self.keep_val:
+            self.val = val
+        
+        self.avg = self.avg*self.count + val*n
         self.count += n
-        self.avg = self.sum / self.count
+        self.avg = self.avg/self.count
+
+    def get_average(self,):
+        return self.avg
+
+    def softmax_average(self, threshold=0.1):
+        self.avg[self.avg<0.1] = 0.0
+        self.avg[self.avg>0.1] = 1.0
+        self.avg = F.softmax(self.avg, dim=1)
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -81,7 +94,7 @@ def load_dictionary_from_file(filepath):
         dictnry = pickle.load(handle)
         return dictnry
 
-def to_one_hot(y, n_dims=None):
+def convert_to_one_hot(y, n_dims=None):
     """ Take integer y (tensor or variable) with n dims and convert it to 1-hot representation with n+1 dims. """
     y_tensor = y.data if isinstance(y, Variable) else y
     y_tensor = y_tensor.type(torch.LongTensor).view(-1, 1)
@@ -95,3 +108,9 @@ def get_beta(avg_gen_error):
     beta = beta if beta <= 1.0 else 1.0
     beta = -1*np.log10(1.1-beta)
     return 1-beta
+
+def threshold_gradient_stiffness(similarity, threshold=0.05, steepness=0.25):
+    similarity = similarity.cpu().numpy()
+    if similarity < threshold + 1e-5:
+        return 1e-5
+    return np.exp(((similarity-threshold)**2)/steepness)

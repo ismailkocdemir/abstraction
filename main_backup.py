@@ -26,7 +26,7 @@ import torchvision.datasets as datasets
 import models
 from autograd_hacks import *
 from utils import *
-from representation import _get_pwcca_avg_pool, _get_pwcca_baseline, _get_RV_avg_pool, _get_RV_baseline, _get_linear_cka_baseline, _get_linear_cka_avg_pool
+from representation import _get_pwcca_avg_pool, _get_pwcca_baseline, _get_RV_avg_pool, _get_RV_baseline
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -34,15 +34,16 @@ model_names = sorted(name for name in models.__dict__
 
 
 stiffness_avg_dict = defaultdict()
-AS_avg_dict = defaultdict()
-interpol_epoch = 0
+interpol_epoch = 10
 stiffness_data_size = 1024
-activation_data_size = 600
 
+AS_updated = []
+first_update = False
 is_best = False
+gen_error = []
 
-layer_activations = defaultdict()
-layer_gradients = defaultdict()
+#layer_activations = defaultdict()
+#layer_gradients = defaultdict()
 
 best_prec1 = 0
 prev_prec = 0
@@ -54,19 +55,16 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='vgg19',
                     ' (default: vgg19)')
 parser.add_argument('--resnet-width', '--rw', default=64,
                     help='Resnet18 width. (default: 64)')
-parser.add_argument('--dataset', '--d', type=str, default='cifar10',
-                        help='dataset to train on.', choices=['cifar10', 'imagenet'])
-
-
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
+parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
+                    help='number of data loading workers (default: 1)')
 parser.add_argument('--epochs', default=500, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
-
+parser.add_argument('-l', '--label-noise', default=0, type=int,
+                     help='\%of label noise in training set (default: 0\%)')
 parser.add_argument('-o', '--optimizer', dest="optim", default="SGD",
                     type=str, help="Optimizer. Options: SGD, Adam")
 parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
@@ -79,18 +77,8 @@ parser.add_argument("--patiance", "--pt", default=0, type=int,
             help="Patiance value for early stopping. Default: 0 (No early stopping)")
 parser.add_argument('--print-freq', '-p', default=20, type=int,
                     metavar='N', help='print frequency (default: 20)')
-parser.add_argument('--kl', dest='kl', action='store_true',
-                    help='use KL divergence as the objective')
-
-
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--assert-lr', dest="assert_lr", action='store_true',
-                    help='Assert larger initial learning rate when resuming, as opposed to \
-                    checkpoint adjustment.')
-parser.add_argument('--constant-lr', dest="constant_lr", action='store_true',
-                    help='Constant learning rate.')
-
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -99,47 +87,41 @@ parser.add_argument('--half', dest='half', action='store_true',
                     help='use half-precision(16-bit) ')
 parser.add_argument('--cpu', dest='cpu', action='store_true',
                     help='use cpu')
-
 parser.add_argument('--save-dir', dest='save_dir',
                     help='The directory used to save the trained models',
                     default='save_temp', type=str)
 parser.add_argument('--activation-dir', dest='act_dir',
                     help='The directory used to save the layer activations',
                     default='activations', type=str)
-
+parser.add_argument('--similarity-metric', dest='sim_met',
+                    help='Similarity metric for layer-wise comparison',
+                    default='RV', type=str)
 parser.add_argument('--collect-cosine', dest='collect_cosine', action='store_true',
                     help='Collect cosine distances of weights to their initial versions')
 parser.add_argument('--collect-acts', dest='collect_activations', action='store_true',
                     help='Collect activations to their initial versions')
 parser.add_argument('--stiffness', dest='stiffness', action='store_true',
                     help='Collect stiffness values for gradients')
-parser.add_argument('--similarity-metric', dest='sim_met',
-                    help='Similarity metric for layer-wise comparison',
-                    default='RV', type=str)
 parser.add_argument('-r', '--refer-initial', dest='refer_init', action='store_true',
                     help='Collect activations that compare to their checkpoint versions OR \
                     cosine distances that refer to initial random weights')
-
-parser.add_argument('-l', '--label-noise', default=0, type=int,
-                     help='\%of label noise in training set (default: 0\%)')
+parser.add_argument('--assert-lr', dest="assert_lr", action='store_true',
+                    help='Assert larger initial learning rate when resuming, as opposed to \
+                    checkpoint adjustment.')
+parser.add_argument('--constant-lr', dest="constant_lr", action='store_true',
+                    help='Constant learning rate.')
 
 
 
 def main():
-    global args, best_prec1, is_best, layer_activations, prev_prec, interpol_epoch
+    global args, best_prec1, gen_error, is_best, layer_activations, activations, prev_prec, interpol_epoch
     args = parser.parse_args()
-    dataset_choice = args.dataset.lower()
 
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-
-    if dataset_choice == "cifar10":
-        model = models.__dict__[args.arch](num_classes=10)
-    else:
-        model = models.__dict__[args.arch](num_classes=1000)
-
+    model = models.__dict__[args.arch]()
 
     if args.cpu:
         model.cpu()
@@ -167,48 +149,15 @@ def main():
     if args.patiance != 0:
         early_stopping = EarlyStopping(patience=args.patiance, verbose=True)
 
-
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
+                                     std=[0.229, 0.224, 0.225])
 
-    if dataset_choice == 'cifar10':
-        train_set = datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
+    train_set = datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(32, 4),
             transforms.ToTensor(),
             normalize,
         ]), download=True)
-
-        val_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-
-
-    else:
-        train_set = datasets.ImageNet(
-            root = './data', train=True,
-            transform = transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True)
-
-        val_loader = torch.utils.data.DataLoader(
-            datasets.ImageNet(root="./data", split='val',
-                trasform=trantransforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-
 
     if args.label_noise > 0:
         set_size = len(train_set.targets)
@@ -220,18 +169,22 @@ def main():
             train_set.targets[idx] = random_labels[i]
             i += 1
 
-
-    train_sampler = None
     train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        train_set,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=False)
 
+    val_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ])),
+        batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=False)
 
     # define loss function (criterion) and optimizer
-    if args.kl:
-        criterion = nn.KLDivLoss(reduction='batchmean')
-    else:
-        criterion = nn.CrossEntropyLoss(reduction='mean')
+    criterion = nn.KLDivLoss(reduction='batchmean')
+    #criterion = nn.CrossEntropyLoss(reduction='mean')
     
     if args.cpu:
         criterion = criterion.cpu()
@@ -265,32 +218,29 @@ def main():
     acc_val_list = []
     loss_train_list = []
     loss_val_list = []
-    
-    if args.start_epoch == 0:
-       save_checkpoint({
-           'epoch': 'baseline',
-            'state_dict': model.state_dict(),
-            'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_baseline.tar'))
+    gen_error = [1.0]
         
     for epoch in range(args.start_epoch, args.epochs):
-        if not args.constant_lr and args.optim.lower() == "sgd":
-            adjust_learning_rate(optimizer, epoch)
+        if not args.constant_lr:
+            adjust_learning_rate(optimizer, epoch, AS_updated)
 
         # train for one epoch
         if args.collect_activations:
             layer_activations.clear()
+            activations.clear()
 
         prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch)        
 
         # evaluate on validation set
         prec1, loss_val = validate(val_loader, model, criterion, epoch)
-
-        if epoch >= interpol_epoch  and epoch%10 == 0:
-            if args.collect_activations:
-                plot_AS(epoch)
-            if args.stiffness:
-                plot_stiffness(epoch)
+        
+        curr_gen_error_ratio = np.abs(loss_train/loss_val)
+        gen_error.append(curr_gen_error_ratio)
+        
+        if args.collect_activations:
+            plot_AS(epoch, curr_gen_error_ratio, prec1_train, prec1)
+        if args.stiffness and epoch >= interpol_epoch  and epoch%10 == 0:
+            plot_stiffness(epoch)
 
         # append loss and prec1 values
         acc_train_list.append(prec1_train)
@@ -338,19 +288,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
     """
         Run one train epoch
     """
-
     global AS_val, interpol_epoch, stiffness_data_size
-
-    assert interpol_epoch % 10 == 0, "Interpolation epoch must be a multiple of 10"
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
 
-    should_update = epoch >= interpol_epoch and epoch%10 == 0
-    
-    if args.stiffness and should_update:
+    assert interpol_epoch % 10 == 0, "Interpolation epoch must be a multiple of 10"
+
+    if args.stiffness and epoch >= interpol_epoch and epoch%10 == 0:
         enable_hooks()
         add_hooks(model)
 
@@ -363,8 +310,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
         beta = 1.0
     else:
         beta = 0.5 # 0.5 + 1.0/(epoch//3) #get_beta(avg_gen_error_ratio)
-
-    beta = 1.0
     print("BETA value: {}".format(beta))
 
     for i, (input, target) in enumerate(train_loader):
@@ -381,36 +326,32 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute output
         optimizer.zero_grad()
 
-        if args.stiffness and args.batch_size*(i+1) >= stiffness_data_size  and should_update:
+        if args.stiffness and epoch >= interpol_epoch and args.batch_size*(i+1) >= stiffness_data_size  and epoch%10 == 0:
             disable_hooks()
             remove_hooks(model)
 
         output = model(input)
         
-        if args.kl:
-            ## Required conversions for KL loss.
-            output_logp = F.log_softmax(output, dim=1)
-            one_hot_target = convert_to_one_hot(target, 10).cuda().float()
-            '''
-            if epoch > interpol_epoch:
-                sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
-                target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
-                if i==0:
-                    print(sim_dist[:3])
-                    print(target_dist[:3])
-                loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
-            else:
-            '''
+        ## Required conversions for KL loss.
+        output_logp = F.log_softmax(output, dim=1)
+        one_hot_target = convert_to_one_hot(target, 10).cuda().float()
+        if epoch > interpol_epoch:
+            sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
+            target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
+            if i==0:
+                print(sim_dist[:3])
+                print(target_dist[:3])
+            loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
+        else:
             loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
 
-        else:
-            ## For CrossEntropy Loss
-            loss = criterion(output, target)
+        ## For CrossEntropy Loss
+        #loss = criterion(output, target)
 
         # compute gradient
         loss.backward()
 
-        if args.stiffness and args.batch_size*(i+1) < stiffness_data_size and should_update:
+        if args.stiffness and epoch >= interpol_epoch and args.batch_size*(i+1) < stiffness_data_size and epoch%10 == 0:
             update_stiffness(model, target)
 
         #do SGD step
@@ -442,9 +383,18 @@ def validate(val_loader, model, criterion, epoch):
     """
     Run evaluation
     """
-    global interpol_epoch, is_best, activation_data_size
-    
-    assert interpol_epoch % 10 == 0, "Interpolation epoch must be a factor of 5"
+    global activations, interpol_epoch
+    global AS_updated
+    global update_patience
+    global counter
+    global gen_error    
+    global first_update
+    global is_best
+    global layer_activations
+    global AS_val
+    #global layer_activations_prev
+
+    assert interpol_epoch % 5 == 0, "Interpolation epoch must be a factor of 5"
 
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -455,24 +405,47 @@ def validate(val_loader, model, criterion, epoch):
 
     end = time.time()
 
-    should_update = (epoch >= interpol_epoch and epoch%10 == 0)
-    
+    should_update = True
+
+    if not args.evaluate and args.collect_activations:
     if args.collect_activations:
-        if args.evaluate or should_update:
-            enable_hooks()
-            add_hooks(model, grad1=False)
+        if args.evaluate:
+            for name, m in model.named_modules():
+                if type(m)==nn.Conv2d or type(m)==nn.Linear:
+                    # partial to assign the layer name to each hook
+                    hooks.append(m.register_forward_hook(partial(get_activation, name)))
+
+        else:
+            if should_update:
+                for name, m in model.named_modules():
+                    #if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv2d):
+                    #if type(m)==nn.Conv2d or type(m)==nn.Linear:
+
+                    # Register the last 3 convolutional layer activations before linear layers.
+                    # These activations seem to be sensitive to the relation between 
+                    #   generlization error and accuracy: When increase in the accuracy slows down
+                    #   generalization gap starts to widen. Also, these layers are most likely to
+                    #   yield high level shared features between classes. 
+
+                    ## THIS WORKS ONLY WITH VGG19 with Batch Norm.
+                    ## Layer indexes needs to be inspected for different architectures.
+                    splt = name.split(".")
+                    if len(splt) == 2:
+                        sub_name, indx = splt
+                        if type(m)==nn.Conv2d and sub_name == "features": # and int(indx) in [3,7,10,14,17,20,23,40, 43, 46, 49]:
+                            # partial to assign the layer name to each hook
+                            hooks.append(m.register_forward_hook(partial(get_activation, name)))
+                        elif sub_name == "classifier" and int(indx) in [1,4,6]:
+                            hooks.append(m.register_forward_hook(partial(get_activation, name)))
 
     if epoch<=interpol_epoch:
         beta = 1.0
     else:
-        beta = 0.5
-
-    beta = 1.0
+        beta = 0.5 #0.5 + 1.0/(epoch//3) #get_beta(avg_gen_error_ratio)
     
     if not args.evaluate and (args.collect_activations or (args.stiffness and epoch==interpol_epoch)):
         final_activations_per_class = torch.zeros([10, 10], dtype=torch.float32).cuda()
         acc = 0
-
     for i, (input, target) in enumerate(val_loader):
 
         if args.cpu == False:
@@ -486,40 +459,36 @@ def validate(val_loader, model, criterion, epoch):
         with torch.no_grad():
             output = model(input)
             
-            if args.kl:
-                ## Required conversions for KL loss.
-                output_logp = F.log_softmax(output, dim=1)
-                one_hot_target = convert_to_one_hot(target, 10).cuda().float()
-                '''
-                if epoch > interpol_epoch:
-                    sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
-                    target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
-                    loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
-                else:
-                '''
-                loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
-            
+            ## Required conversions for KL loss.
+            output_logp = F.log_softmax(output, dim=1)
+            one_hot_target = convert_to_one_hot(target, 10).cuda().float()
+            if epoch > interpol_epoch:
+                sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
+                target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
+                loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
             else:
-                ## For CrossEntropy Loss
-                loss = criterion(output, target)
+                loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
 
         if args.collect_activations:
-            if args.batch_size*(i+1) > activation_data_size: 
-                disable_hooks()
-                remove_hooks(model)
+            if args.batch_size*(i+1) > 4096: 
+                if len(activations):
+                    activations.clear()
+                    for h in hooks:
+                        h.remove()
             else:
                 if args.evaluate:
-                    save_activations(args.act_dir, i)
+                    for k,v in activations.items():
+                        dest = os.path.join(args.act_dir, "{0}_{1}.npy".format(k, i))
+                        np.save(dest, v.numpy())
                 
-                elif should_update:
-                    for k,v in get_activations().items():
-                        if k not in layer_activations.keys():
-                            layer_activations[k] = defaultdict(list)
-
-                        v_np = v.detach().cpu().numpy()
+                elif should_update: #not should_downgrade and epoch >= 10:
+                    for k,v in activations.items():
+                        v_np = v.clone().detach().cpu().numpy()
                         for c in range(10):
+                            if c not in layer_activations.keys():
+                                 layer_activations[c] = defaultdict(list)
                             class_indexes = (target.cpu().numpy() == c)
-                            layer_activations[k][c].append(v_np[class_indexes])
+                            layer_activations[c][k].append(v_np[class_indexes])
 
         output = output.float()
         loss = loss.float()
@@ -528,7 +497,7 @@ def validate(val_loader, model, criterion, epoch):
         prec1 = accuracy(output.data, target)[0]
 
         #accumulate class activations
-        if not args.evaluate and ((args.collect_activations or args.stiffness) and epoch==interpol_epoch):
+        if not args.evaluate and (args.collect_activations or (args.stiffness and epoch==interpol_epoch)):
             acc +=1
             for c in range(10):
                 class_indices = target == c
@@ -585,7 +554,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     """
     torch.save(state, filename)
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch, AS_updated):
     """Sets the learning rate to initial-rate * 1/sqrt(epoch)"""
     if epoch == 0:
         return
@@ -672,26 +641,22 @@ def update_stiffness(model, target):
 
 
 def calculate_batch_stiffness(grads1, grads2):
-    '''
     grads1 = torch.cat((grads1, grads1), 0)
     grads2 = torch.cat((grads2, torch.flip(grads2, dims=[0,])), 0)
     sim = F.cosine_similarity(grads1, grads2, dim=1)
     sim[sim<0] = 0
     sim = torch.mean(sim, dim=0)
-    '''
 
-    grads1 = grads1.view(grads1.size(0),-1)
-    grads1_c = grads1 - grads1.mean(dim=1).unsqueeze(1)
-    grads1_n = grads1_c / (1e-8 + torch.sqrt(torch.sum(grads1_c**2, dim=1))).unsqueeze(1)
-
-    grads2 = grads2.view(grads2.size(0),-1)
-    grads2_c = grads2 - grads2.mean(dim=1).unsqueeze(1)
-    grads2_n = grads2_c / (1e-8 + torch.sqrt(torch.sum(grads2_c**2, dim=1))).unsqueeze(1)
-    
-    R = grads1_n.matmul(grads2_n.transpose(1,0)).clamp(-1,1)
-    R[R<0] = 0
-
-    return torch.mean(R)
+    if grad1.dim() == 4:
+        x.size(1) > 3 and x.size(2) > 1:
+            z = x.view(x.size(0), x.size(1), -1)
+            x = z.std(dim=2)
+        else:
+            x = x.view(x.size(0),-1)
+    xc = x - x.mean(dim=1).unsqueeze(1)
+    xn = xc / (1e-8 + torch.sqrt(torch.sum(xc**2, dim=1))).unsqueeze(1)
+    R = xn.matmul(xn.transpose(1,0)).clamp(-1,1)
+    return sim
 
 def plot_stiffness(epoch):
     global stiffness_avg_dict
@@ -704,76 +669,171 @@ def plot_stiffness(epoch):
     for k, STF in stiffness_avg_dict.items():
         _stiffness = STF.get_average().cpu().numpy()
         ax1 = sns.heatmap(_stiffness, vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
-        plt.savefig(os.path.join(save_dir, "{1}_class_stiffness_{2}_EPOCH-{0}.png".format(epoch,args.arch, k)))
+        plt.savefig(os.path.join(save_dir, "{1}_class_sim_{2}_EPOCH-{0}.png".format(epoch,args.arch, k)))
         plt.clf()
 
+
 def update_AS(epoch):
-    global AS_avg_dict
+    global layer_activations
+    global AS_final, AS_fc, AS_highest, AS_high, AS_mid_high, AS_mid, AS_mid_low
+    global baseline_AS_fc, baseline_AS_highest, baseline_AS_high, baseline_AS_mid_high, baseline_AS_mid, baseline_AS_mid_low
 
-    for name, act_list in layer_activations.items():
-        if name not in AS_avg_dict:
-            AS_avg_dict[name] = torch.zeros([10, 10], dtype=torch.float32)
+    for c1 in range(10):
+        for c2 in range(c1, 10):
+            c1_act_list = layer_activations[c1]
+            c2_act_list = layer_activations[c2]
+            similarity_final = 0.0
+            similarity_fc = 0.0
+            similarity_highest = 0.0
+            similarity_high = 0.0
+            similarity_mid_high = 0.0
+            similarity_mid = 0.0
+            similarity_mid_low = 0.0
 
-        for c1 in range(10):
-            for c2 in range(c1, 10):
-                c1_act_list = act_list[c1]
-                c2_act_list = act_list[c2]
+            baseline_similarity_fc = 0.0
+            baseline_similarity_highest = 0.0
+            baseline_similarity_high = 0.0
+            baseline_similarity_mid_high = 0.0
+            baseline_similarity_mid = 0.0
+            baseline_similarity_mid_low = 0.0
 
-                c1_act = c1_act_list[:len(c1_act_list)//2]
-                c2_act = c2_act_list[len(c2_act_list)//2:]
+            for k, c1_act_o in c1_act_list.items():
+            
+                c1_act = c1_act_o[:len(c1_act_o)//2]
+                c2_act = c2_act_list[k][len(c2_act_list[k])//2:]
 
+                splt = k.split(".")
+                sub_name, indx = splt
                 stacked_c1 = np.vstack(c1_act)
                 stacked_c2 = np.vstack(c2_act)
 
-                
-                AS_avg_dict[name][c1, c2] = _get_RV_avg_pool(stacked_c1, stacked_c2, activation_data_size).item()
-                if c1 != c2:
-                    AS_avg_dict[name][c2, c1] = AS_avg_dict[name][c1, c2]  
+                #if sub_name == "classifier" and int(indx) == 6:
+                #    current_sim = _get_pwcca_avg_pool(stacked_c1, stacked_c2, 512)
+                #else:
+                current_sim = _get_RV_avg_pool(stacked_c1, stacked_c2, 512)
 
                 if epoch == 0:
-                    bl_name = name + "_BASELINE"
-                    if bl_name not in AS_avg_dict:
-                        AS_avg_dict[bl_name] = torch.zeros([10, 10], dtype=torch.float32)
-                    AS_avg_dict[bl_name][c1, c2] = _get_RV_baseline(stacked_c1, stacked_c2, activation_data_size).item()
-                    if c1 != c2:
-                        AS_avg_dict[bl_name][c2, c1] = AS_avg_dict[bl_name][c1, c2]
+                    current_sim_baseline = _get_RV_baseline(stacked_c1, stacked_c2, 512)
 
-            avg_key = None        
-            sub_name, indx = name.split(".")
-            if sub_name == "features": 
-                if int(indx) < 25:
-                    avg_key = "early_conv_avg"
-                elif int(indx) >= 40:
-                    avg_key = "late_conv_avg"
+                if sub_name == "features":
+                    if int(indx) in [20,23]:#[3,7,10]:
+                        similarity_mid_low += current_sim
+                        if epoch == 0:
+                            baseline_similarity_mid_low = current_sim_baseline
+                    elif int(indx) in [27,30]:#[14,17,20,23]:
+                        similarity_mid += current_sim
+                        if epoch == 0:
+                            baseline_similarity_mid = current_sim_baseline
+                    elif int(indx) in [33,36]:#[27,30,33,36]:
+                        similarity_mid_high += current_sim
+                        if epoch == 0:
+                            baseline_similarity_mid_high = current_sim_baseline
+                    elif int(indx) in [40,43]:
+                        similarity_high += current_sim
+                        if epoch == 0:
+                            baseline_similarity_high = current_sim_baseline
+                    elif int(indx) in [46,49]:
+                        similarity_highest += current_sim
+                        if epoch == 0:
+                            baseline_similarity_highest = current_sim_baseline
+                else:
+                    if int(indx) in [1,4]:
+                        similarity_fc += current_sim
+                    else:
+                        similarity_final += current_sim
+                    if epoch == 0:
+                        baseline_similarity_fc = current_sim_baseline
+        
+            AS_final[c1,c2] = similarity_final
+            AS_fc[c1,c2] = similarity_fc/2
+            AS_highest[c1,c2] = similarity_highest/2
+            AS_high[c1,c2] = similarity_high/2
+            AS_mid_high[c1,c2] = similarity_mid_high/2
+            AS_mid[c1,c2] = similarity_mid/2
+            AS_mid_low[c1,c2] = similarity_mid_low/2
 
-            if avg_key:
-                if avg_key not in AS_avg_dict:
-                    AS_avg_dict[avg_key] = AverageMeter(torch.zeros([10, 10], dtype=torch.float32).cpu(), keep_val=False)
+            if epoch == 0:
+                baseline_AS_fc[c1,c2] = baseline_similarity_fc/2
+                baseline_AS_highest[c1,c2] = baseline_similarity_highest/2
+                baseline_AS_high[c1,c2] = baseline_similarity_high/2
+                baseline_AS_mid_high[c1,c2] = baseline_similarity_mid_high/2
+                baseline_AS_mid[c1,c2] = baseline_similarity_mid/2
+                baseline_AS_mid_low[c1,c2] = baseline_similarity_mid_low/2
+        
+    for c1 in range(10):
+        for c2 in range(c1):
+            AS_final[c1,c2] = AS_final[c2,c1]
+            AS_fc[c1,c2] = AS_fc[c2,c1]
+            AS_highest[c1,c2] = AS_highest[c2,c1]
+            AS_high[c1,c2] = AS_high[c2,c1]
+            AS_mid_high[c1,c2] = AS_mid_high[c2,c1]
+            AS_mid[c1,c2] = AS_mid[c2,c1]
+            AS_mid_low[c1,c2] = AS_mid_low[c2,c1]
 
-                AS_avg_dict[avg_key].update(AS_avg_dict[name].cpu())
-
-    AS_avg_dict["late_conv_avg"] = AS_avg_dict["late_conv_avg"].get_average()
-    AS_avg_dict["early_conv_avg"] = AS_avg_dict["early_conv_avg"].get_average()
+            if epoch == 0:
+                baseline_AS_fc[c1,c2] = baseline_AS_fc[c2,c1]
+                baseline_AS_highest[c1,c2] = baseline_AS_highest[c2,c1]
+                baseline_AS_high[c1,c2] = baseline_AS_high[c2,c1]
+                baseline_AS_mid_high[c1,c2] = baseline_AS_mid_high[c2,c1]
+                baseline_AS_mid[c1,c2] = baseline_AS_mid[c2,c1]
+                baseline_AS_mid_low[c1,c2] = baseline_AS_mid_low[c2,c1]
 
     layer_activations.clear()
-    
+    #print(AS)
+    #for i in range(10):
+    #    mean = torch.mean(AS[i,:])
+    #    std = torch.std(AS[i,:])
+    #    AS[i,:] = (AS[i,:]-mean)/std
 
-def plot_AS(epoch):
-    global stiffness_avg_dict
-    save_dir = 'figures/class_sim/{0}'.format(args.arch)
+    #AS_high = F.softmax(AS, dim=1)
+    #if first_update:
+    #    AS_val = AS_high
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
 
+def plot_AS(epoch, curr_gen_error_ratio, acc_train, acc_val):
     plt.clf()
-    for k, AS in AS_avg_dict.items():
-        if epoch != 0 and "BASELINE" in k:
-            continue
+    ax1 = sns.heatmap(AS_mid_low.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_MID_LOW_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax2 = sns.heatmap(AS_mid.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_MID_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax3 = sns.heatmap(AS_mid_high.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_MID_HIGH_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax4 = sns.heatmap(AS_high.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_HIGH_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax5 = sns.heatmap(AS_highest.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_HIGHEST_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax6 = sns.heatmap(AS_fc.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_FC_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
+    plt.clf()
+    ax0 = sns.heatmap(AS_final.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+    plt.savefig("figures/class_sim/{4}/{4}_class_sim_FINAL_EPOCH-{0}_gen-error-{1:.2f}__{2:.1f}-{3:.1f}.png".format(epoch, curr_gen_error_ratio, acc_train, acc_val, args.arch))
 
-        _sim = AS.cpu().numpy()
-        ax1 = sns.heatmap(_sim, vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
-        plt.savefig(os.path.join(save_dir, "{1}_actvtn_similarity_{2}_EPOCH-{0}.png".format(epoch,args.arch, k)))
+    if epoch == 0:
         plt.clf()
+        ax7 = sns.heatmap(baseline_AS_mid_low.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_MID_LOW_BASELINE.png".format(args.arch))
+        plt.clf()
+        ax8 = sns.heatmap(baseline_AS_mid.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_MID_BASELINE.png".format(args.arch))
+        plt.clf()
+        ax9 = sns.heatmap(baseline_AS_mid_high.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_MID_HIGH_BASELINE.png".format(args.arch))
+        plt.clf()
+        ax10 = sns.heatmap(baseline_AS_high.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_HIGH_BASELINE.png".format(args.arch))
+        plt.clf()
+        ax11 = sns.heatmap(baseline_AS_highest.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_HIGHEST_BASELINE.png".format(args.arch))
+        plt.clf()
+        ax12 = sns.heatmap(baseline_AS_fc.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
+        plt.savefig("figures/class_sim/{0}/{0}_class_sim_FC_BASELINE.png".format(args.arch))
+
+
 
 def plot_cosine_distances(param_keys, distance_list, timestamp):
     """ Plots cosine distance values of layer weights (w.r.t intialization values)"""
@@ -827,6 +887,32 @@ def plot_cosine_distances(param_keys, distance_list, timestamp):
     final_dict["distance_list"] = distance_list
     save_dictionary_to_file(data_path, final_dict)
 
+def plot_similarities(timestamp):
+    """ Plots activation similarities that we kept track of during training"""
+    
+    global mean_cca_list
+    global baseline_cca_list
+
+    save_path = "figures/inLayer-similarity/{2}_{1}_inLayer-similarity_wrt-{0}_{3}.png".format(
+        ("initial" if args.refer_init else "prev"), k, args.arch)
+    
+    for k,v in mean_cca_list.items():
+        v_baseline = baseline_cca_list[k]
+        plt.figure()
+        plt.xlabel("Epoch")
+        plt.ylabel("Similarity")
+        plt.grid()
+        plt.plot(v, label=args.sim_met)
+        plt.plot(v_baseline, label='Baseline')
+        plt.legend(loc='upper right')
+        plt.savefig(save_path)
+        plt.clf()
+
+    final_dict = vars(args)
+    final_dict["similarity_list"] = mean_cca_list
+    final_dict["baseline_list"] = baseline_cca_list
+    data_path = "data/inlayer_similarity/{1}_inLayer-similarities_{0}.pickle".format(timestamp, args.arch)
+    save_dictionary_to_file(data_path, final_dict)
 
 def plot_train_val_accs(train_accs, val_accs, timestamp):
     """  Plots training and validation accuarcy values in a single figure"""
@@ -886,6 +972,36 @@ def plot_loss(train_loss, val_loss, timestamp):
     final_dict["train_loss"] = train_loss
     final_dict["val_loss"] = val_loss
     save_dictionary_to_file(data_path, final_dict)
+
+
+def calculate_sim_for_epoch():
+    """ calculates similarity of the activations in each layer compared to previous ones """
+    
+    global layer_activations, layer_activations_prev
+
+    for k,v in layer_activations.items():
+        act_current = np.vstack(v)
+        act_prev = np.vstack(layer_activations_prev[k])
+        
+        # depending on the metric calculate baseline and original similarity for each layer
+        if method == "RV":
+            mean_cca = _get_pwcca_avg_pool(act_current, act_prev, 500)
+            baseline_cca = _get_pwcca_baseline(act_current, act_prev, 500)
+        elif method == "pwcca":
+            mean_cca = _get_pwcca_avg_pool(act_current, act_prev, 2500)
+            baseline_cca = _get_pwcca_baseline(act_current, act_prev, 2500)
+        
+        mean_cca_list[k].append(mean_cca)
+        baseline_cca_list[k].append(baseline_cca)
+
+    # if refer_init, we keep track similarity of activations w.r.t first epoch activations.
+    if args.refer_init:
+        layer_activations.clear()
+    # else we take previous epoch as refernce
+    else:
+        layer_activations_prev.clear()
+        layer_activations_prev = layer_activations
+        layer_activations = defaultdict(list)
 
 if __name__ == '__main__':
     main()
