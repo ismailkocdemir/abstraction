@@ -35,7 +35,7 @@ parser.add_argument('--architecture2', '--a2', default='resnet18k_16',
                 help='Second architecture (default: resnet18k_16)')
 parser.add_argument('--reference-layer-idx', '-r', default=-1, type=int,
                 metavar='N', help='Similarity is calculated against this layer for all layers (default: -1)')
-parser.add_argument('--num-datapoints', '-n', default=500, type=int,
+parser.add_argument('--num-datapoints', '-n', default=512, type=int,
                 metavar='D', help='Number of datapoints used OR Dimension of the activation space (default: 500)')
 parser.add_argument('--min-epoch', default=0, type=int,
                  help='first epoch of the model for the activations (default: 0)')
@@ -58,48 +58,6 @@ def _plot_helper(arr_x, arr_y, baseline_y,  xlabel, ylabel, save_path="svcca_def
     plt.grid()
     plt.savefig(save_path)
 
-def _plot_helper_per_epoch(arr_x, values, ylabel, baseline, epochs, save_path="plot_default.png", in_net=True):
-
-    plt.xlabel("Layer")
-    plt.ylabel(ylabel)
-    plt.xticks(rotation=90)
-    plt.grid()
-    plt.subplots_adjust(bottom=0.25)
-
-    if baseline:
-        baseline = baseline[1:]
-    arr_x = arr_x[:-1]
-    values = [item[1:] for item in values]
-    
-    if epochs == None:
-        plt.plot(arr_x, values[0], color='b', marker="o", linestyle="-")
-        
-        splt = save_path.split('/')
-        splt.insert(-1, 'progress')
-        save_path_new = os.path.join(*splt)
-
-        plt.savefig(save_path_new)
-        plt.clf()
-        return
-
-    c = np.array([item for item in epochs if item!='baseline'])
-
-    norm = mpl.colors.Normalize(vmin=c.min(), vmax=c.max())
-    cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.inferno)
-    cmap.set_array([])
-    
-    if baseline:
-        plt.plot(arr_x, baseline,  color='k', linestyle='--', label='baseline')
-    for idx, epoch in enumerate(epochs):
-        if epoch == 'baseline':
-            plt.plot(arr_x, values[idx],  color='k', linestyle='--', label='baseline')
-        else:
-            plt.plot(arr_x, values[idx], c=cmap.to_rgba(epoch))
-
-    cbar = plt.colorbar(cmap, ticks=[c[0], c[-1]])
-    cbar.set_label("Epoch")
-    plt.savefig(save_path)
-    plt.clf()
 
 def demo():
     # Toy Example of CCA in action
@@ -120,6 +78,143 @@ def demo():
 
     _plot_helper(list(range(len(results["cca_coef1"]))), results["cca_coef1"],  
                         results["cca_coef1"],"CCA coef idx", "CCA coef value", "cca_demo.png")
+
+
+def _plot_helper_per_epoch(arr_x, values, ylabel, baseline, epochs, save_path="plot_default.png", in_net=True, xlabel="Layer"):
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=90)
+    plt.grid()
+    plt.subplots_adjust(bottom=0.25)
+
+    
+    ### If epochs is None, we need to plot for only given epoch, which is an intermediate result.
+    if epochs == None:
+        for idx, val in enumerate(values):
+            
+            if xlabel == "Dimension Idx" and arr_x.shape[0] > val.shape[0]:
+                original_values = val[:]
+                val = np.zeros_like(arr_x)
+                val[:original_values.shape[0]] = original_values
+
+            plt.plot(arr_x, val, color='b', marker="o", linestyle="-")
+            
+            #Since this is an intermediate result, save the figure into a separate folder.
+            splt = save_path.split('/')
+            splt.insert(-1, 'progress')
+            save_path_new = os.path.join(*splt)
+
+            plt.savefig(save_path_new)
+            plt.clf()
+        return
+
+    ### When epochs are given, we are plotting all epochs together.
+    c = np.array([item for item in epochs if item!='baseline'])
+
+    norm = mpl.colors.Normalize(vmin=c.min(), vmax=c.max())
+    cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.inferno)
+    cmap.set_array([])
+    
+    """
+        Baseline is given separately when calculating activation similarity.
+        This is because for activation similarity, baseline is the similarity of random 
+        activation, NOT activations calculated from initial weights.
+
+        Baseline is given within values and epochs when calculating abstractness.
+        This is because for abstractness, baseline is abstractness of initial weights when
+        given real/natural data.  
+    """
+
+    # If baseline is given sperataley (this should happen when activation similarity is plotted),
+    # we plot it using the values in 'baseline' variable.  
+    if baseline:
+        plt.plot(arr_x, baseline,  color='k', linestyle='--', label='baseline')
+    for idx, epoch in enumerate(epochs):
+        
+        if  xlabel!="Layer" and arr_x.shape[0] > values[idx].shape[0]:
+            original_values = values[idx][:]
+            values[idx] = np.zeros_like(arr_x)
+            values[idx][:original_values.shape[0]] = original_values
+
+        # when baseline is not givenseparately (this should happeb when calculating abstractness),
+        # it is included in the epochs array, where we plot it with a different(dashed) line style. 
+        
+        if epoch == 'baseline':
+            plt.plot(arr_x, values[idx],  color='k', linestyle='--', label='baseline')
+        else:
+            plt.plot(arr_x, values[idx], c=cmap.to_rgba(epoch))
+
+    cbar = plt.colorbar(cmap, ticks=[c[0], c[-1]])
+    cbar.set_label("Epoch")
+    plt.savefig(save_path)
+    plt.clf()
+
+def _plot_helper_per_epoch_scatter(arr_x, values, ylabel, baseline, epochs, save_path="plot_default.png", in_net=True, xlabel="Layer"):
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=90)
+    plt.grid()
+    plt.subplots_adjust(bottom=0.25)
+    
+    ### If epochs is None, we need to plot for only given epoch, which is an intermediate result.
+    if epochs == None:
+        for idx, val in enumerate(values):
+            
+            if xlabel!="Layer" and arr_x.shape[0] > val.shape[0]:
+                original_values = val[:]
+                val = np.zeros_like(arr_x)
+                val[:original_values.shape[0]] = original_values
+
+            plt.scatter(arr_x, val, color='b', marker="o", linestyle="-")
+            
+            #Since this is an intermediate result, save the figure into a separate folder.
+            splt = save_path.split('/')
+            splt.insert(-1, 'progress')
+            save_path_new = os.path.join(*splt)
+
+            plt.savefig(save_path_new)
+            plt.clf()
+        return
+
+    ### When epochs are given, we are plotting all epochs together.
+    c = np.array([item for item in epochs if item!='baseline'])
+
+    norm = mpl.colors.Normalize(vmin=c.min(), vmax=c.max())
+    cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.inferno)
+    cmap.set_array([])
+    
+    """
+        Baseline is given separately when calculating activation similarity.
+        This is because for activation similarity, baseline is the similarity of random 
+        activation, NOT activations calculated from initial weights.
+
+        Baseline is given within values and epochs when calculating abstractness.
+        This is because for abstractness, baseline is abstractness of initial weights when
+        given real/natural data.  
+    """
+
+    # If baseline is given sperataley (this should happen when activation similarity is plotted),
+    # we plot it using the values in 'baseline' variable.  
+    if baseline:
+        plt.plot(arr_x, baseline,  color='k', linestyle='--', label='baseline')
+    for idx, epoch in enumerate(epochs):
+        
+        # when baseline is not givenseparately (this should happeb when calculating abstractness),
+        # it is included in the epochs array, where we plot it with a different(dashed) line style. 
+        
+        if epoch == 'baseline':
+            continue
+            #plt.scatter(arr_x[idx], values[idx],  color='k', linestyle='--', label='baseline')
+        else:
+            plt.scatter(arr_x[idx], values[idx], c=[cmap.to_rgba(epoch) for item in arr_x[idx]])
+
+    cbar = plt.colorbar(cmap, ticks=[c[0], c[-1]])
+    cbar.set_label("Epoch")
+    plt.savefig(save_path)
+    plt.clf()
+
 
 def _gram_schmidt_columns(X):
     Q, R = np.linalg.qr(X)
@@ -151,6 +246,13 @@ def KL_along_data_axis(values, verbose=False):
 
     values_stable = (values - values.min()) + 1e-10
     return entropy_scipy(values_stable, uniform)
+
+def entropy_stable(values):
+    
+    values_stable = (values - values.min()) + 1e-10
+    
+    return entropy_scipy(values_stable)
+
 
 def gram_linear(x):
     """Compute Gram (kernel) matrix for a linear kernel.
@@ -327,7 +429,6 @@ def _get_abstraction_baseline(acts1, num_datapoints):
 
     return ent_sum/i
  
-
 def _get_linear_cka_baseline(acts1, acts2, num_datapoints):
 
     a1shapes = [None, None]
@@ -482,6 +583,84 @@ def _get_abstraction_avg_pool(acts, num_datapoints):
     print(acts.shape)
     if len(acts.shape) > 2:
         # Activation is convolutianal. Perform average pooling.
+
+        if acts.shape[2] < 4 or acts.shape[3] < 4:
+            acts = acts.reshape((acts.shape[0], -1))
+        else:
+            acts = np.mean(acts, axis=(2,3))
+
+    # Get the maximum number of datapoints that is common in the activation pair.
+    num_datapoints = min(acts.shape[0], num_datapoints)
+    acts = acts[:num_datapoints, :]
+
+    #acts = acts - np.mean(acts, axis=0)
+    
+    verbose = False
+    kl_along_data = 0.0
+    ent_along_data = 0.0
+    kl_along_data_channels = []
+    kl_along_neuron = 0.0
+    sv_ent = 0.0
+    gram_ent = 0.0
+    U1, s1, V1 = np.linalg.svd(acts, full_matrices=False)
+    
+    dimensionality = s1.shape[0]
+    _total = np.sum(s1)
+    _sum = 0.0
+
+    for i, item in enumerate(s1.tolist()):
+        if i>0:
+            # This selection statistic is able to capture the 10 classes in the activations of the layer before classification.
+            # However, I think, it seems like it ignores the abstract information that seems like noise due to its outlier nature in lower layers.
+            
+            if _sum/_total >= 0.80 and item/s1[0] <= 0.01:
+                dimensionality = i
+                break
+
+            # Try lossing the condition on being irrelevant/counted as noise for a singular vectors.
+            '''
+            if _sum/_total >= 0.95:
+                dimensionality = i
+                break
+            '''
+
+        _sum += item
+
+    # In addition to loosining the relevance condition, 
+    # try to ignore the vector(s) with largest singular value(s),
+    # as it might overshadow the relevant information.
+    start_index = 0
+    sv_ent = entropy_stable(s1[start_index:dimensionality])
+    
+    reduced_U1 = U1[:,start_index:dimensionality]
+    reduced_s1 = np.diag(s1[start_index:dimensionality])
+
+    reduced_acts = np.matmul(reduced_U1, reduced_s1)
+
+
+    for i in range(reduced_acts.shape[1]):
+        _kl = KL_along_data_axis(reduced_acts[:, i], verbose=verbose)
+        _ent = entropy_stable(reduced_acts[:, i])
+
+        kl_along_data = (kl_along_data*i + _kl)/(i+1)
+        ent_along_data = (ent_along_data*i + _ent)/(i+1)
+        kl_along_data_channels.append(_kl)
+   
+    for i in range(reduced_acts.shape[0]):
+        kl_along_neuron = (kl_along_neuron*i + KL_along_neuron_axis(reduced_acts[i],verbose=verbose))/(i+1)
+
+
+    abst_dict = {"kl-data":kl_along_data, "kl-neuron":kl_along_neuron, "entropy-sv": sv_ent,
+                "entropy-data":ent_along_data, "dimensionality": dimensionality, 
+                "kl-data-channels": kl_along_data_channels}
+
+    return abst_dict
+
+def _get_sv_avg_pool(acts, num_datapoints):
+
+    print(acts.shape)
+    if len(acts.shape) > 2:
+        # Activation is convolutianal. Perform average pooling.
         acts = np.mean(acts, axis=(2,3))
 
     # Get the maximum number of datapoints that is common in the activation pair.
@@ -489,23 +668,23 @@ def _get_abstraction_avg_pool(acts, num_datapoints):
     acts = acts[:num_datapoints, :]
     
     verbose = False
-    kl_along_data = 0.0
-    kl_along_neuron = 0.0
-    dimensionality = 0.0
-
-    for i in range(acts.shape[1]):
-        kl_along_data = (kl_along_data*i + KL_along_data_axis(acts[:, i],verbose=verbose))/(i+1)
-   
-    for i in range(acts.shape[0]):
-        kl_along_neuron = (kl_along_neuron*i + KL_along_neuron_axis(acts[i],verbose=verbose))/(i+1)
-
+    
     U1, s1, V1 = np.linalg.svd(acts, full_matrices=False)
-    s1 += 1e-8
-    dimensionality = entropy_scipy(s1)
 
-    abst_dict = {"kl-data":kl_along_data, "kl-neuron":kl_along_neuron, "entropy-sv": dimensionality}
+    total = np.sum(s1)
+    _sum = 0.0
+    for i, item in enumerate(s1.tolist()):
 
-    return abst_dict
+        if _sum/total >= 0.50 and item/s1[0] <= 0.01:
+            if i==0:
+                return s1[0]
+            else: 
+                return s1[:i]
+
+        _sum += item
+
+        
+    return s1
 
 def _get_linear_cka_avg_pool(acts1, acts2, num_datapoints):
     if len(acts1.shape) > 2:
@@ -543,7 +722,6 @@ def _remove_activations(arch):
         clean_command = "rm activations/{0}/*".format(arch_and_optim)
         os.system(clean_command)
     
-    
 def _produce_activations(arch, checkpoint_epoch):
 
     arch, arch_and_optim = parse_arch(arch)
@@ -560,7 +738,7 @@ def _produce_activations(arch, checkpoint_epoch):
     --evaluate --collect-acts --activation-dir activations/{2}/".format(arch, checkpoint_epoch, arch_and_optim)
     os.system(command)
 
-def _get_architecture_activations(arch, num_datapoints=500):
+def _get_architecture_activations(arch, num_datapoints):
     act_dict = defaultdict()
     all_dict = defaultdict(list)
 
@@ -666,97 +844,93 @@ def _calculate_sim_from_activations(method, arch, num_datapoints, reference_laye
         traceback.print_exc()
         return
 
-'''
 def _calculate_sv_from_activations(arch, num_datapoints, epoch):
-    """ calculates abstractness of the activations of all layers for a specific checkpoint """
+    """ calculates singular values of the activations of all layers for a specific checkpoint """
 
-    act_dict, dict_keys = _get_architecture_activations(arch)
+    act_dict, dict_keys = _get_architecture_activations(arch, num_datapoints)
 
-    kl_data_abs = []
-    kl_neuron_abs = []
-    entropy_sv_abs = []
-
-    all_x = []
+    sv_layers = defaultdict()
     try:
         for l in dict_keys:
-            all_x.append(l) 
-            
             current_layer = act_dict[l]            
-            abst = 0
+            sv = 0
             
             print("Calculating:", l)
-            abst = _get_abstraction_avg_pool(current_layer, num_datapoints)
-            kl_data_abs.append(abst['kl-data'])
-            kl_neuron_abs.append(abst['kl-neuron'])
-            entropy_sv_abs.append(abst['entropy-sv'])
+            sv = _get_sv_avg_pool(current_layer, num_datapoints)
+            sv_layers[l] = sv
 
-            if epoch == "baseline":
-                print("  Baseline avg. abstractness (kl-data, kl-neuron, entropy-sv):", ["{:.2f}".format(item) for item in list(abst.values())] )
-            else:
-                print("  Original avg. abstractness (kl-data, kl-neuron, entropy-sv):", ["{:.2f}".format(item) for item in list(abst.values())] ) 
-            print(" ")
+            fig_save_path = "figures/singular_values/{1}_{3}_epoch-{2}_{0}.png".format(num_datapoints, 
+                                                                                arch, epoch, l)
+            x_dim = np.arange(len(sv))
+            _plot_helper_per_epoch(x_dim, [sv,], "Singular Value", None, None, fig_save_path, False, "Dimension Idx")
 
-        fig_save_path_kl_data = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'kl-data')
-        fig_save_path_kl_neuron = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'kl-neuron')
-        fig_save_path_entropy_sv = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'entropy-sv')
-
-        _plot_helper_per_epoch(all_x, [kl_data_abs,], "Abstractness kl-data", None, None, fig_save_path_kl_data)
-        _plot_helper_per_epoch(all_x, [kl_neuron_abs,], "Abstractness kl-neuron", None, None, fig_save_path_kl_neuron)
-        _plot_helper_per_epoch(all_x, [entropy_sv_abs,], "Abstractness entropy-sv", None, None, fig_save_path_entropy_sv)
-
-        all_abs = {'kl-data':kl_data_abs, 'kl-neuron':kl_neuron_abs, 'entropy-sv':entropy_sv_abs}
-        return all_x, all_abs
+        return sv_layers
     except Exception as e:
         traceback.print_exc()
         return
-'''
 
-
-def _calculate_abs_from_activations(arch, num_datapoints, epoch):
+def _calculate_abstraction_from_activations(arch, num_datapoints, epoch):
     """ calculates abstractness of the activations of all layers for a specific checkpoint """
 
-    act_dict, dict_keys = _get_architecture_activations(arch)
+    act_dict, dict_keys = _get_architecture_activations(arch, num_datapoints)
 
-    kl_data_abs = []
-    kl_neuron_abs = []
-    entropy_sv_abs = []
-    baseline_abs = []
-    all_x = []
+    abstraction_dict = defaultdict(list)
+    layer_channels = []
+
+    x_dimension = []
+    x_dimension_channels = []
     try:
-        for l in dict_keys:
-            all_x.append(l) 
+        for idx, l in enumerate(dict_keys):
+            if idx == 0:
+                continue
             
+            x_dimension.append(dict_keys[idx-1])
             current_layer = act_dict[l]            
-            abst = 0
             
-            print("Calculating:", l)
+            print("Calculating:", dict_keys[idx-1])
             abst = _get_abstraction_avg_pool(current_layer, num_datapoints)
-            kl_data_abs.append(abst['kl-data'])
-            kl_neuron_abs.append(abst['kl-neuron'])
-            entropy_sv_abs.append(abst['entropy-sv'])
-
+            
+            for k,v in abst.items():
+                if "channels" in k:
+                    x_dimension_channels += [dict_keys[idx-1] for item in v]
+                    layer_channels += v
+                else:
+                    abstraction_dict[k].append(v)
+            '''    
             if epoch == "baseline":
-                print("  Baseline avg. abstractness (kl-data, kl-neuron, entropy-sv):", ["{:.2f}".format(item) for item in list(abst.values())] )
+                print("  Baseline ({}):".format(" ".join(abst.keys())), 
+                    ["{:.2f}".format(item) for item in list(abst.values())] )
             else:
-                print("  Original avg. abstractness (kl-data, kl-neuron, entropy-sv):", ["{:.2f}".format(item) for item in list(abst.values())] ) 
+                print("  Original ({}):".format(" ".join(abst.keys())), 
+                    ["{:.2f}".format(item) for item in list(abst.values())] ) 
             print(" ")
+            '''
 
-        fig_save_path_kl_data = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'kl-data')
-        fig_save_path_kl_neuron = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'kl-neuron')
-        fig_save_path_entropy_sv = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(num_datapoints, 
-                                                                            arch, epoch, 'entropy-sv')
 
-        _plot_helper_per_epoch(all_x, [kl_data_abs,], "Abstractness kl-data", None, None, fig_save_path_kl_data)
-        _plot_helper_per_epoch(all_x, [kl_neuron_abs,], "Abstractness kl-neuron", None, None, fig_save_path_kl_neuron)
-        _plot_helper_per_epoch(all_x, [entropy_sv_abs,], "Abstractness entropy-sv", None, None, fig_save_path_entropy_sv)
+        scatter_save_path = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}_SCATTER.png".format(
+                                                                                num_datapoints, 
+                                                                                arch, 
+                                                                                epoch, k)
+            
+        _plot_helper_per_epoch_scatter(x_dimension_channels, 
+                                    [layer_channels,], 
+                                    "Abstractness kl-data",
+                                     None, None, 
+                                     scatter_save_path)
 
-        all_abs = {'kl-data':kl_data_abs, 'kl-neuron':kl_neuron_abs, 'entropy-sv':entropy_sv_abs}
-        return all_x, all_abs
+
+        for k,v in abstraction_dict.items():
+            fig_save_path = "figures/layer_abstractness/{3}/{1}_{0}_{3}_epoch_{2}.png".format(
+                                                                                num_datapoints, 
+                                                                                arch, 
+                                                                                epoch, k)
+            _plot_helper_per_epoch(x_dimension, 
+                                    [v,], 
+                                    "Abstractness {}".format(k),
+                                     None, None, 
+                                     fig_save_path)
+
+        return x_dimension, abstraction_dict, x_dimension_channels, layer_channels
     except Exception as e:
         traceback.print_exc()
         return
@@ -778,7 +952,6 @@ def calculate_sim_per_checkpoint(method, arch, num_datapoints, reference_layer, 
     layer_axis = None
     similarities = []
     baseline = None
-
 
     arch, arch_and_optim = parse_arch(arch)
 
@@ -829,7 +1002,7 @@ def calculate_sim_per_checkpoint(method, arch, num_datapoints, reference_layer, 
 
             similarities.append(simil)
 
-    fig_save_path = "figures/layer_similarity/{3}_{1}_refLayer{2}_{0}.svg".format(num_datapoints, 
+    fig_save_path = "figures/layer_similarity/{3}_{1}_refLayer{2}_{0}.png".format(num_datapoints, 
                                                                                 arch_and_optim, reference_layer, method)
 
     data_save_path = "data/layer_similarity/{3}_{1}_refLayer{2}_{0}.pickle".format(num_datapoints, 
@@ -856,10 +1029,10 @@ def calculate_sim_between_nets(arch1, arch2, method, epoch1, epoch2, num_datapoi
             epoch2 = sorted([int(file.split(".")[0].split("_")[-1]) for file in f])[-1]    
 
     _produce_activations(arch1, epoch1)
-    acts_dict1, dict_keys1 = _get_architecture_activations(arch1)
+    acts_dict1, dict_keys1 = _get_architecture_activations(arch1, num_datapoints)
 
     _produce_activations(arch2, epoch2)
-    acts_dict2, dict_keys2 = _get_architecture_activations(arch2)
+    acts_dict2, dict_keys2 = _get_architecture_activations(arch2, num_datapoints)
 
     if len(acts_dict1) != len(acts_dict2):
         raise ValueError("Number of layers does not match for comparison: {0} vs. {1}".
@@ -910,15 +1083,13 @@ def calculate_sim_between_nets(arch1, arch2, method, epoch1, epoch2, num_datapoi
     save_dictionary_to_file(data_save_path, final_dict)
 
 
-'''
+
 def calculate_singular_values_per_layer_per_epoch(arch, num_datapoints, min_epoch, max_epoch, step):
     
-    final_dict = locals()
     epochs = []
     used_epochs = []
     used_checkpoints = []
-    layer_axis = None
-    singular_values = defaultdict(list)
+    singular_values_all_epochs = defaultdict(list)
     baseline = None
 
     arch, arch_and_optim = parse_arch(arch)
@@ -970,22 +1141,26 @@ def calculate_singular_values_per_layer_per_epoch(arch, num_datapoints, min_epoc
 
             _produce_activations(arch_and_optim, checkpoint_epoch)
 
-            dim_axis, sv = _calculate_sv_from_activations(arch_and_optim, num_datapoints, 
+            sv_dict_current_epoch = _calculate_sv_from_activations(arch_and_optim, num_datapoints, 
                                 checkpoint_epoch) 
             
-            for key, val in abstractness.items():
-                abstractness_values[key].append(val)
+            for _layer, _sv_list in sv_dict_current_epoch.items():
+                singular_values_all_epochs[_layer].append(_sv_list)
 
             _remove_activations(arch_and_optim)
 
-    for key, val in abstractness_values.items():
+    for _layer, _list_sv_list in singular_values_all_epochs.items():
+        _max_size = 0
+        for item in _list_sv_list:
+            if len(item)>_max_size:
+                _max_size = len(item)
 
-        fig_save_path = "figures/layer_abstractness/{2}/{1}_{0}_{2}.svg".format(num_datapoints, arch_and_optim, key)
+        fig_save_path = "figures/singular_values/{1}_{2}_sv_{0}.png".format(num_datapoints, arch_and_optim, _layer)
         #data_save_path = "data/layer_abstractness/{1}_{0}_{2}.pickle".format(num_datapoints, arch_and_optim)
 
-        _plot_helper_per_epoch(layer_axis, val, "Abstractness", None, used_epochs, fig_save_path)
+        x_axis = np.arange(_max_size)
+        _plot_helper_per_epoch(x_axis, _list_sv_list, "Singular Value", None, used_epochs, fig_save_path, False, "Dimension Idx")
    
-'''
 
 def calculate_network_abstraction_per_epoch(arch, num_datapoints, min_epoch, max_epoch, step):
 
@@ -995,6 +1170,8 @@ def calculate_network_abstraction_per_epoch(arch, num_datapoints, min_epoch, max
     used_checkpoints = []
     layer_axis = None
     abstractness_values = defaultdict(list)
+    layer_axis_channel_scatter = []
+    abstractness_values_scatter = []
     baseline = None
 
 
@@ -1047,9 +1224,13 @@ def calculate_network_abstraction_per_epoch(arch, num_datapoints, min_epoch, max
 
             _produce_activations(arch_and_optim, checkpoint_epoch)
 
-            layer_axis, abstractness = _calculate_abs_from_activations(arch_and_optim, num_datapoints, 
-                                checkpoint_epoch) 
+            layer_axis, abstractness, layer_axis_scatter, abstractness_scatter = _calculate_abstraction_from_activations(
+                arch_and_optim, 
+                num_datapoints, 
+                checkpoint_epoch) 
             
+            layer_axis_channel_scatter.append(layer_axis_scatter)
+            abstractness_values_scatter.append(abstractness_scatter)
             for key, val in abstractness.items():
                 abstractness_values[key].append(val)
 
@@ -1057,16 +1238,19 @@ def calculate_network_abstraction_per_epoch(arch, num_datapoints, min_epoch, max
 
     for key, val in abstractness_values.items():
 
-        fig_save_path = "figures/layer_abstractness/{2}/{1}_{0}_{2}.svg".format(num_datapoints, arch_and_optim, key)
-        #data_save_path = "data/layer_abstractness/{1}_{0}_{2}.pickle".format(num_datapoints, arch_and_optim)
+        fig_save_path = "figures/layer_abstractness/{2}/{1}_{0}_{2}.png".format(num_datapoints, arch_and_optim, key)
+        _plot_helper_per_epoch(layer_axis, val, "Abstractness {}".format(key), None, used_epochs, fig_save_path)
+        
 
-        _plot_helper_per_epoch(layer_axis, val, "Abstractness", None, used_epochs, fig_save_path)
-        '''
-        final_dict["used_checkpoints"] = used_checkpoints
-        final_dict["abstractness_values"] = val
-        final_dict["baseline"] = baseline
-        save_dictionary_to_file(data_save_path, final_dict)
-        '''
+    scatter_save_path = "figures/layer_abstractness/{2}/{1}_{0}_{2}_SCATTER.png".format(num_datapoints, arch_and_optim, "kl-data-channels")
+    _plot_helper_per_epoch_scatter(layer_axis_channel_scatter, abstractness_values_scatter, "Abstractness kl-data-channels", None, used_epochs, scatter_save_path)
+    
+    '''
+    final_dict["used_checkpoints"] = used_checkpoints
+    final_dict["abstractness_values"] = val
+    final_dict["baseline"] = baseline
+    save_dictionary_to_file(data_save_path, final_dict)
+    '''
 
 
 def main():
@@ -1093,8 +1277,19 @@ def main():
                                 )
 
     elif args.run_mode.lower() == 'abstraction':
-        calculate_network_abstraction_per_epoch(args.architecture, args.num_datapoints, args.min_epoch, args.max_epoch, args.step)
+        calculate_network_abstraction_per_epoch(args.architecture, 
+                                    args.num_datapoints, 
+                                    args.min_epoch, 
+                                    args.max_epoch, 
+                                    args.step)
 
+
+    elif args.run_mode.lower() == 'singular-value':
+        calculate_singular_values_per_layer_per_epoch(args.architecture, 
+                                    args.num_datapoints, 
+                                    args.min_epoch, 
+                                    args.max_epoch, 
+                                    args.step)
 
 if __name__ == '__main__':
     main()

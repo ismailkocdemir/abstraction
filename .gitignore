@@ -129,7 +129,7 @@ dmypy.json
 .pyre/
 
 
-## DL ##
+## my additions ##
 # Large checkpoints and activations
-.tar
-.npy
+*.tar
+*.npy

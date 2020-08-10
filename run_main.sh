@@ -1,2 +1,3 @@
-python3 main.py -a vgg19_bn --save-dir checkpoints/vgg19_bn/ --collect-acts --epochs 200
-python3 main.py -a vgg19 --save-dir checkpoints/vgg19/ --collect-cosine --epochs 200
+python3 main.py -a resnet18 --save-dir checkpoints/resnet_cifar10_224x224/resnet18 --epochs 300 --batch-size 128
+python3 main.py -a resnet18 --save-dir checkpoints/resnet_cifar10_224x224/resnet18_adam --epochs 300 --optimizer adam --batch-size 128
+

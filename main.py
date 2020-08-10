@@ -32,12 +32,11 @@ model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
-
 stiffness_avg_dict = defaultdict()
 AS_avg_dict = defaultdict()
 interpol_epoch = 0
 stiffness_data_size = 1024
-activation_data_size = 600
+activation_data_size = 512
 
 is_best = False
 
@@ -172,21 +171,37 @@ def main():
                                          std=[0.229, 0.224, 0.225])
 
     if dataset_choice == 'cifar10':
-        train_set = datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(32, 4),
-            transforms.ToTensor(),
-            normalize,
-        ]), download=True)
+        
+        if 'resnet18' == args.arch.lower().split("_")[0]:
+            _transforms = transforms.Compose([
+                            transforms.RandomHorizontalFlip(),
+                            transforms.Resize(224),
+                            transforms.ToTensor(),
+                            normalize,
+                        ])
+            _transforms_val = transforms.Compose([
+                                    transforms.Resize(224),
+                                    transforms.ToTensor(),
+                                    normalize,
+                                ])
+        else:
+            _transforms = transforms.Compose([
+                            transforms.RandomHorizontalFlip(),
+                            transforms.RandomCrop(32, 4),
+                            transforms.ToTensor(),
+                            normalize,
+                        ])
+            _transforms_val = _transforms_val = transforms.Compose([
+                                    transforms.ToTensor(),
+                                    normalize,
+                                ])
+
+        train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
 
         val_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-
+            datasets.CIFAR10(root='./data', train=False, transform=_transforms_val, download=True),
+                            batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.workers, pin_memory=True)
 
     else:
         train_set = datasets.ImageNet(
@@ -220,12 +235,10 @@ def main():
             train_set.targets[idx] = random_labels[i]
             i += 1
 
-
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
 
     # define loss function (criterion) and optimizer
     if args.kl:
