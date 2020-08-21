@@ -33,10 +33,10 @@ model_names = sorted(name for name in models.__dict__
                      and callable(models.__dict__[name]))
 
 stiffness_avg_dict = defaultdict()
+epoch_interval = 5
 AS_avg_dict = defaultdict()
-interpol_epoch = 0
 stiffness_data_size = 1024
-activation_data_size = 512
+activation_data_size = 1024
 
 is_best = False
 
@@ -57,8 +57,6 @@ parser.add_argument('--dataset', '--d', type=str, default='cifar10',
                         help='dataset to train on.', choices=['cifar10', 'imagenet'])
 
 
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=500, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -66,6 +64,10 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
 parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
 
+
+## OPTIMIZATION
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
 parser.add_argument('-o', '--optimizer', dest="optim", default="SGD",
                     type=str, help="Optimizer. Options: SGD, Adam")
 parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
@@ -105,6 +107,10 @@ parser.add_argument('--save-dir', dest='save_dir',
 parser.add_argument('--activation-dir', dest='act_dir',
                     help='The directory used to save the layer activations',
                     default='activations', type=str)
+parser.add_argument('--grad-dir', dest='grad_dir',
+                    help='The directory used to save the layer gradients',
+                    default='gradients', type=str)
+
 
 parser.add_argument('--collect-cosine', dest='collect_cosine', action='store_true',
                     help='Collect cosine distances of weights to their initial versions')
@@ -125,7 +131,7 @@ parser.add_argument('-l', '--label-noise', default=0, type=int,
 
 
 def main():
-    global args, best_prec1, is_best, layer_activations, prev_prec, interpol_epoch
+    global args, best_prec1, is_best, layer_activations, prev_prec
     args = parser.parse_args()
     dataset_choice = args.dataset.lower()
 
@@ -133,12 +139,10 @@ def main():
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-
     if dataset_choice == "cifar10":
         model = models.__dict__[args.arch](num_classes=10)
     else:
         model = models.__dict__[args.arch](num_classes=1000)
-
 
     if args.cpu:
         model.cpu()
@@ -166,12 +170,11 @@ def main():
     if args.patiance != 0:
         early_stopping = EarlyStopping(patience=args.patiance, verbose=True)
 
-
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
 
     if dataset_choice == 'cifar10':
-        
+        """
         if 'resnet18' == args.arch.lower().split("_")[0]:
             _transforms = transforms.Compose([
                             transforms.RandomHorizontalFlip(),
@@ -185,16 +188,17 @@ def main():
                                     normalize,
                                 ])
         else:
-            _transforms = transforms.Compose([
-                            transforms.RandomHorizontalFlip(),
-                            transforms.RandomCrop(32, 4),
-                            transforms.ToTensor(),
-                            normalize,
-                        ])
-            _transforms_val = _transforms_val = transforms.Compose([
-                                    transforms.ToTensor(),
-                                    normalize,
-                                ])
+        """
+        _transforms = transforms.Compose([
+                        transforms.RandomHorizontalFlip(),
+                        transforms.RandomCrop(32, 4),
+                        transforms.ToTensor(),
+                        normalize,
+                    ])
+        _transforms_val = _transforms_val = transforms.Compose([
+                                transforms.ToTensor(),
+                                normalize,
+                            ])
 
         train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
 
@@ -299,7 +303,7 @@ def main():
         # evaluate on validation set
         prec1, loss_val = validate(val_loader, model, criterion, epoch)
 
-        if epoch >= interpol_epoch  and epoch%10 == 0:
+        if epoch >= epoch_interval  and epoch%10 == epoch_interval:
             if args.collect_activations:
                 plot_AS(epoch)
             if args.stiffness:
@@ -352,16 +356,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
         Run one train epoch
     """
 
-    global AS_val, interpol_epoch, stiffness_data_size
-
-    assert interpol_epoch % 10 == 0, "Interpolation epoch must be a multiple of 10"
+    global AS_val, epoch_interval, stiffness_data_size
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
 
-    should_update = epoch >= interpol_epoch and epoch%10 == 0
+    should_update = epoch%epoch_interval == 0 # and epoch >= epoch_interval
     
     if args.stiffness and should_update:
         enable_hooks()
@@ -371,14 +373,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
-    
-    if epoch <= interpol_epoch:
-        beta = 1.0
-    else:
-        beta = 0.5 # 0.5 + 1.0/(epoch//3) #get_beta(avg_gen_error_ratio)
-
-    beta = 1.0
-    print("BETA value: {}".format(beta))
 
     for i, (input, target) in enumerate(train_loader):
 
@@ -404,16 +398,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
             ## Required conversions for KL loss.
             output_logp = F.log_softmax(output, dim=1)
             one_hot_target = convert_to_one_hot(target, 10).cuda().float()
-            '''
-            if epoch > interpol_epoch:
-                sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
-                target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
-                if i==0:
-                    print(sim_dist[:3])
-                    print(target_dist[:3])
-                loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
-            else:
-            '''
             loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
 
         else:
@@ -424,13 +408,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
         loss.backward()
 
         if args.stiffness and args.batch_size*(i+1) < stiffness_data_size and should_update:
-            update_stiffness(model, target)
+            update_stiffness(model, target, i)
 
         #do SGD step
         optimizer.step()
         # measure accuracy and record loss
         output = output.float()
         loss = loss.float()
+        
         prec1 = accuracy(output.data, target)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
@@ -448,17 +433,14 @@ def train(train_loader, model, criterion, optimizer, epoch):
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
 
-    
     return top1.avg, losses.avg
 
 def validate(val_loader, model, criterion, epoch):
     """
     Run evaluation
     """
-    global interpol_epoch, is_best, activation_data_size
+    global is_best, activation_data_size
     
-    assert interpol_epoch % 10 == 0, "Interpolation epoch must be a factor of 5"
-
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -468,21 +450,14 @@ def validate(val_loader, model, criterion, epoch):
 
     end = time.time()
 
-    should_update = (epoch >= interpol_epoch and epoch%10 == 0)
+    should_update = epoch%epoch_interval == 0
     
     if args.collect_activations:
         if args.evaluate or should_update:
             enable_hooks()
             add_hooks(model, grad1=False)
 
-    if epoch<=interpol_epoch:
-        beta = 1.0
-    else:
-        beta = 0.5
-
-    beta = 1.0
-    
-    if not args.evaluate and (args.collect_activations or (args.stiffness and epoch==interpol_epoch)):
+    if not args.evaluate and (args.collect_activations or args.stiffness):
         final_activations_per_class = torch.zeros([10, 10], dtype=torch.float32).cuda()
         acc = 0
 
@@ -503,13 +478,6 @@ def validate(val_loader, model, criterion, epoch):
                 ## Required conversions for KL loss.
                 output_logp = F.log_softmax(output, dim=1)
                 one_hot_target = convert_to_one_hot(target, 10).cuda().float()
-                '''
-                if epoch > interpol_epoch:
-                    sim_dist = torch.index_select(stiffness_avg_dict["late_conv_avg"].get_average(), 0, target.cpu()).cuda().float()
-                    target_dist = (beta*one_hot_target + (1-beta)*sim_dist)
-                    loss = criterion(output_logp.cuda(async=True), target_dist.cuda(async=True))
-                else:
-                '''
                 loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
             
             else:
@@ -541,7 +509,7 @@ def validate(val_loader, model, criterion, epoch):
         prec1 = accuracy(output.data, target)[0]
 
         #accumulate class activations
-        if not args.evaluate and ((args.collect_activations or args.stiffness) and epoch==interpol_epoch):
+        if not args.evaluate and (args.collect_activations or args.stiffness): #and epoch==epoch_interval):
             acc +=1
             for c in range(10):
                 class_indices = target == c
@@ -555,9 +523,6 @@ def validate(val_loader, model, criterion, epoch):
 
                 if x_not_nan.size()[0] != 0:
                     final_activations_per_class[c] += torch.mean(x_not_nan, dim=0)
-                #else:
-                #    print("zero size")
-
 
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
@@ -574,7 +539,7 @@ def validate(val_loader, model, criterion, epoch):
                       i, len(val_loader), batch_time=batch_time, loss=losses,
                       top1=top1))
 
-    if not args.evaluate and ((args.collect_activations or args.stiffness) and epoch==interpol_epoch):
+    if not args.evaluate and (args.collect_activations or args.stiffness): # and epoch==epoch_interval):
         if args.collect_activations:
             update_AS(epoch)
 
@@ -612,7 +577,7 @@ def adjust_learning_rate(optimizer, epoch):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-def update_stiffness(model, target):
+def update_stiffness(model, target, i):
     """ Compute the class similarity matices from the gradient stiffness values """
     global stiffness_avg_dict
     with torch.no_grad():
@@ -621,6 +586,9 @@ def update_stiffness(model, target):
         for name, param in model.named_parameters():
             if 'bias' in name:
                 continue
+
+            dest = os.path.join(args.grad_dir, "{0}_{1}.npy".format(name, i))
+            np.save(dest, (param.grad1 - param.grad).numpy())
 
             if name not in stiffness_avg_dict:
                 stiffness_avg_dict[name] = AverageMeter(torch.zeros([10, 10], dtype=torch.float32).cuda(), keep_val=False)
@@ -773,7 +741,7 @@ def update_AS(epoch):
 
 def plot_AS(epoch):
     global stiffness_avg_dict
-    save_dir = 'figures/class_sim/{0}'.format(args.arch)
+    save_dir = 'figures/class_similarity/{0}'.format(args.arch)
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)

@@ -19,7 +19,8 @@ __all__ = [
     'vgg19_bn', 'vgg19_bn_lb', 'vgg19_bn_4','vgg19_bn_8','vgg19_bn_16','vgg19_bn_32',
     'vgg19', 'vgg19_4','vgg19_8','vgg19_16','vgg19_32',
     'resnet18k_4','resnet18k_8','resnet18k_16','resnet18k_32','resnet18preAct',
-    'resnet18', 'resnet34', 'resnet50', 'resnet101'
+    'resnet18preAct_bn',
+    'resnet18_bn', 'resnet34', 'resnet50', 'resnet101'
 ]
 
 model_urls = {
@@ -118,7 +119,6 @@ class VGG(nn.Module):
                 continue
             buffer_key = name.replace(".", "_")
             self._buffers[buffer_key] = param.detach().cpu()
-
 
     def print_arch(self):
         for name, param in self.named_modules():
@@ -269,8 +269,9 @@ class PreActBlock(nn.Module):
     '''Pre-activation version of the BasicBlock.'''
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, **kwargs):
+    def __init__(self, in_planes, planes, stride=1, bn=True, **kwargs):
         super(PreActBlock, self).__init__()
+        self.bn = bn
         self.bn1 = nn.BatchNorm2d(in_planes)
         self.conv1 = nn.Conv2d(
             in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
@@ -285,15 +286,24 @@ class PreActBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = F.relu(self.bn1(x))
+        if self.bn:
+            out = F.relu(self.bn1(x))
+        else:
+            out = F.relu(x)
+        
         shortcut = self.shortcut(out) if hasattr(self, 'shortcut') else x
         out = self.conv1(out)
-        out = self.conv2(F.relu(self.bn2(out)))
+        
+        if self.bn:
+            out =  self.conv2(F.relu(self.bn2(out)))
+        else:
+            out =  self.conv2(F.relu(out))
+
         out += shortcut
         return out
 
 class PreActResNet(nn.Module):
-    def __init__(self, block, num_blocks,  init_channels=64, num_classes = 10):
+    def __init__(self, block, num_blocks, init_channels=64, num_classes = 10, bn = True):
         super(PreActResNet, self).__init__()
         self.in_planes = init_channels
         c = init_channels
@@ -301,10 +311,10 @@ class PreActResNet(nn.Module):
 
         self.conv1 = nn.Conv2d(3, c, kernel_size=3,
                                stride=1, padding=1, bias=False)
-        self.layer1 = self._make_layer(block, c, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 2*c, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 4*c, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 8*c, num_blocks[3], stride=2)
+        self.layer1 = self._make_layer(block, c, num_blocks[0], stride=1, bn=bn)
+        self.layer2 = self._make_layer(block, 2*c, num_blocks[1], stride=2, bn=bn)
+        self.layer3 = self._make_layer(block, 4*c, num_blocks[2], stride=2, bn=bn)
+        self.layer4 = self._make_layer(block, 8*c, num_blocks[3], stride=2, bn=bn)
         self.fc = nn.Linear(8*c*block.expansion, num_classes)
 
         for m in self.modules():
@@ -321,12 +331,12 @@ class PreActResNet(nn.Module):
                 #print("buffer {0} is registered".format(name.replace(".", "_")))
 
 
-    def _make_layer(self, block, planes, num_blocks, stride):
+    def _make_layer(self, block, planes, num_blocks, stride, bn):
         # eg: [2, 1, 1, ..., 1]. Only the first one downsamples.
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
+            layers.append(block(self.in_planes, planes, stride, bn))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
@@ -587,14 +597,6 @@ class ResNet(nn.Module):
 
 
 
-def _resnet(arch, block, layers, pretrained, progress, **kwargs):
-    model = ResNet(block, layers, **kwargs)
-    if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch],
-                                              progress=progress)
-        model.load_state_dict(state_dict)
-    return model
-    
 
 def resnet18k_4(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
@@ -612,11 +614,25 @@ def resnet18k_32(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
     return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=32, num_classes=num_classes)
 
+def resnet18preact_bn(num_classes=10) -> PreActResNet:
+    ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=64, num_classes=num_classes, bn=True)
+
 def resnet18preact(num_classes=10) -> PreActResNet:
     ''' Returns a ResNet18 with width parameter k. (k=64 is standard ResNet18)'''
-    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=64, num_classes=num_classes)
+    return PreActResNet(PreActBlock, [2, 2, 2, 2], init_channels=64, num_classes=num_classes, bn=False)
 
-def resnet18(pretrained=False, progress=True, **kwargs):
+
+
+def _resnet(arch, block, layers, pretrained, progress, **kwargs):
+    model = ResNet(block, layers, **kwargs)
+    if pretrained:
+        state_dict = load_state_dict_from_url(model_urls[arch],
+                                              progress=progress)
+        model.load_state_dict(state_dict)
+    return model
+    
+def resnet18_bn(pretrained=False, progress=True, **kwargs):
     r"""ResNet-18 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
 

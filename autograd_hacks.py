@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import numpy as np
 
 _supported_layers = ['Linear', 'Conv2d']  # Supported layer class types
+_activation_layers = ["BatchNorm2d"]
 _hooks_disabled: bool = False           # work-around for https://github.com/pytorch/pytorch/issues/25723
 
 _forward_handles = []
@@ -56,14 +57,16 @@ def add_hooks(model: nn.Module, grad1: bool = True) -> None:
     global _hooks_disabled, _forward_handles, _backward_handles
     _hooks_disabled = False
 
-    #handles = []
     for name, layer in model.named_modules():
         if is_module_supported(name, layer):
             # partial to assign the layer name to each hook
-            _forward_handles.append(layer.register_forward_hook(partial(_capture_activations, name)))
+
             if grad1:
+                _forward_handles.append(layer.register_forward_hook(partial(_capture_activations_before_layer, name)))
                 _backward_handles.append(layer.register_backward_hook(partial(_capture_backprops, name)))
-        
+
+            else:
+                _forward_handles.append(layer.register_forward_hook(partial(_capture_activations_after_layer, name)))
 
 def remove_hooks(model: nn.Module) -> None:
     """
@@ -116,7 +119,7 @@ def _layer_type(layer: nn.Module) -> str:
     return layer.__class__.__name__
 
 
-def _capture_activations(name, layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
+def _capture_activations_before_layer(name, layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
     """Save activations into layer.activations in forward pass"""
 
     if _hooks_disabled:
@@ -126,6 +129,15 @@ def _capture_activations(name, layer: nn.Module, input: List[torch.Tensor], outp
     #setattr(layer, "activations", input[0].detach().cpu())
     _activations[name] = input[0].detach().cpu() #output.detach().cpu()
 
+def _capture_activations_after_layer(name, layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
+    """Save activations into layer.activations in forward pass"""
+
+    if _hooks_disabled:
+        return
+    assert _layer_type(layer) in _activation_layers, "Hook installed on unsupported layer, this shouldn't happen"
+    
+    #setattr(layer, "activations", input[0].detach().cpu())
+    _activations[name] = output.detach().cpu() #output.detach().cpu()
 
 
 def _capture_backprops(name, layer: nn.Module, _input, output):
