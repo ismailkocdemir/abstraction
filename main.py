@@ -19,6 +19,8 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.optim
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
+
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -35,8 +37,6 @@ model_names = sorted(name for name in models.__dict__
 stiffness_avg_dict = defaultdict()
 epoch_interval = 5
 AS_avg_dict = defaultdict()
-stiffness_data_size = 1024
-activation_data_size = 1024
 
 is_best = False
 
@@ -56,21 +56,31 @@ parser.add_argument('--resnet-width', '--rw', default=64,
 parser.add_argument('--dataset', '--d', type=str, default='cifar10',
                         help='dataset to train on.', choices=['cifar10', 'imagenet'])
 
-
-parser.add_argument('--epochs', default=500, type=int, metavar='N',
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=128, type=int,
-                    metavar='N', help='mini-batch size (default: 128)')
-
+parser.add_argument('-b', '--batch-size', default=64, type=int,
+                    metavar='N', help='mini-batch size (default: 64)')
+parser.add_argument('--seed', default=None, type=int,
+					help='seed for initializing the weights')
 
 ## OPTIMIZATION
+parser.add_argument("--adaptive-decay", "--ad", default=False, dest="adaptive_decay",
+                    action="store_true", help="if provided, apply adaptive weight decay")
+parser.add_argument("--single-layer", "--sl", default=False, dest="single_layer",
+                    action="store_true", help="if provided, adaptive weight decay is not accumulated down the network")
+parser.add_argument("--noise-penalty", "--np", default=False, dest="noise_penalty",
+                    action="store_true", help="if provided, include noise sensitivity in the loss")
+parser.add_argument("--jacobian-penalty", "--jp", default=False, dest="jacobian_penalty",
+                    action="store_true", help="if provided, include jacobian of each layer in the loss")
+parser.add_argument("--dropout", "--dr", default=False, dest="dropout",
+                    action="store_true", help="if provided, apply dropout with default rate")
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('-o', '--optimizer', dest="optim", default="SGD",
                     type=str, help="Optimizer. Options: SGD, Adam")
-parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
@@ -78,11 +88,10 @@ parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
                     metavar='W', help='weight decay (default: 5e-4)')
 parser.add_argument("--patiance", "--pt", default=0, type=int,
             help="Patiance value for early stopping. Default: 0 (No early stopping)")
-parser.add_argument('--print-freq', '-p', default=20, type=int,
-                    metavar='N', help='print frequency (default: 20)')
+parser.add_argument('--print-freq', '-p', default=40, type=int,
+                    metavar='N', help='print frequency (default: 40)')
 parser.add_argument('--kl', dest='kl', action='store_true',
                     help='use KL divergence as the objective')
-
 
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -111,13 +120,16 @@ parser.add_argument('--grad-dir', dest='grad_dir',
                     help='The directory used to save the layer gradients',
                     default='gradients', type=str)
 
-
 parser.add_argument('--collect-cosine', dest='collect_cosine', action='store_true',
                     help='Collect cosine distances of weights to their initial versions')
 parser.add_argument('--collect-acts', dest='collect_activations', action='store_true',
                     help='Collect activations to their initial versions')
+parser.add_argument('--activation-size', dest='activation_size', default=2048,
+                    type=int,  help='number of sample to collect activations')
 parser.add_argument('--stiffness', dest='stiffness', action='store_true',
                     help='Collect stiffness values for gradients')
+parser.add_argument('--stiffness-size', dest='stifness_size', default=2048,
+                    type=int,  help='number of sample to collect gradients')
 parser.add_argument('--similarity-metric', dest='sim_met',
                     help='Similarity metric for layer-wise comparison',
                     default='RV', type=str)
@@ -127,27 +139,56 @@ parser.add_argument('-r', '--refer-initial', dest='refer_init', action='store_tr
 
 parser.add_argument('-l', '--label-noise', default=0, type=int,
                      help='\%of label noise in training set (default: 0\%)')
-
-
+parser.add_argument('--in', '--input-noise', dest='input_noise', action='store_true',
+                    help='add gaussian noise to the input')
+parser.add_argument('--sigma', default=0.1, type=float,
+                     help='std. of the gaussian noise added to input')
+parser.add_argument('--lambd', default=0.5, type=float,
+                     help='adaptive ratio base')
+parser.add_argument('--alpha', default=5e-3, type=float,
+                     help='contribution ratio for regularizers')
+parser.add_argument('--sim-loss', dest='sim_loss',
+                    help="measures the distance between activations",
+                    default='mse', type=str)
 
 def main():
     global args, best_prec1, is_best, layer_activations, prev_prec
     args = parser.parse_args()
     dataset_choice = args.dataset.lower()
-
-    # Check the save_dir exists or not
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
+    
+    if args.noise_penalty:
+        args.arch = "_".join([args.arch.split("_")[0] + "MO"] + args.arch.split("_")[1:])
+    elif args.jacobian_penalty:
+        args.arch = "_".join([args.arch.split("_")[0] + "Jacobian"] + args.arch.split("_")[1:])
 
     if dataset_choice == "cifar10":
-        model = models.__dict__[args.arch](num_classes=10)
+        model = models.__dict__[args.arch](num_classes=10, dropout=args.dropout, seed=args.seed)
     else:
-        model = models.__dict__[args.arch](num_classes=1000)
+        model = models.__dict__[args.arch](num_classes=1000, dropout=args.dropout, seed=args.seed)
 
     if args.cpu:
         model.cpu()
     else:
         model.cuda()
+
+    '''
+    for n, m in model.named_parameters():
+        print(n, m.size())
+
+    print("=++++++++++++++++++++++++++++++++++++++++++++=")
+    sys.exit()
+    '''
+
+    # Check the save_dir exists or not
+    checkpoint_save_dir = os.path.join("checkpoints", args.save_dir)
+    accuracy_save_dir = os.path.join("figures/training_plots/accuracy", args.save_dir)
+    loss_save_dir = os.path.join("figures/training_plots/loss", args.save_dir)
+    if not os.path.exists(checkpoint_save_dir):
+        os.makedirs(checkpoint_save_dir)
+    if not os.path.exists(accuracy_save_dir):
+        os.makedirs(accuracy_save_dir)
+    if not os.path.exists(loss_save_dir):
+        os.makedirs(loss_save_dir)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -162,8 +203,10 @@ def main():
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
+        '''
         if args.collect_cosine and not args.refer_init:
             model.update_reference_weights()
+        '''
 
     cudnn.benchmark = True
     
@@ -174,31 +217,26 @@ def main():
                                          std=[0.229, 0.224, 0.225])
 
     if dataset_choice == 'cifar10':
-        """
-        if 'resnet18' == args.arch.lower().split("_")[0]:
-            _transforms = transforms.Compose([
-                            transforms.RandomHorizontalFlip(),
-                            transforms.Resize(224),
-                            transforms.ToTensor(),
-                            normalize,
-                        ])
-            _transforms_val = transforms.Compose([
-                                    transforms.Resize(224),
-                                    transforms.ToTensor(),
-                                    normalize,
-                                ])
-        else:
-        """
+
         _transforms = transforms.Compose([
                         transforms.RandomHorizontalFlip(),
                         transforms.RandomCrop(32, 4),
                         transforms.ToTensor(),
                         normalize,
                     ])
-        _transforms_val = _transforms_val = transforms.Compose([
-                                transforms.ToTensor(),
-                                normalize,
-                            ])
+
+        if args.input_noise:
+            _transforms_val = transforms.Compose([
+                                    transforms.ToTensor(),
+                                    normalize,
+                                    AddGaussianNoise(0., args.sigma),
+                                ])
+        
+        else:    
+            _transforms_val = transforms.Compose([
+                                    transforms.ToTensor(),
+                                    normalize,
+                                ])
 
         train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
 
@@ -228,7 +266,6 @@ def main():
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True)
 
-
     if args.label_noise > 0:
         set_size = len(train_set.targets)
         percentage = args.label_noise + args.label_noise/9.0
@@ -238,17 +275,19 @@ def main():
         for idx in random_indexes:
             train_set.targets[idx] = random_labels[i]
             i += 1
-
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
+    
     # define loss function (criterion) and optimizer
     if args.kl:
         criterion = nn.KLDivLoss(reduction='batchmean')
     else:
-        criterion = nn.CrossEntropyLoss(reduction='mean')
+        if args.jacobian_penalty:
+            criterion = JacobianRegularizerCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda=args.lambd)
+        elif args.noise_penalty:
+            criterion = NoiseSensitivityCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda = args.lambd, sim_loss=args.sim_loss)
+        elif args.adaptive_decay:
+            criterion = AdaptiveDecayCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda=args.lambd, single_layer=args.single_layer)
+        else:
+            criterion = nn.CrossEntropyLoss(reduction='mean')
     
     if args.cpu:
         criterion = criterion.cpu()
@@ -259,20 +298,26 @@ def main():
         model.half()
         criterion.half()
 
+    if args.evaluate:
+        validate(val_loader, model, criterion, 0)
+        return
+
+    train_sampler = None
+    train_loader = torch.utils.data.DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
     if args.optim.lower() == "sgd": 
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     elif args.optim.lower() == "adam":
         if args.lr == 0.05:
-            args.lr = 1e-3
-        optimizer = torch.optim.Adam(model.parameters(), args.lr)
+            optimizer = torch.optim.Adam(model.parameters())
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), args.lr)
     else:
         raise ValueError("Invalid optimizer choice: \"{0}\". Options are: \"SGD\", \"Adam\"".format(args.optim))
-
-    if args.evaluate:
-        validate(val_loader, model, criterion, 0)
-        return
 
     if args.collect_cosine:
         param_keys = []
@@ -288,27 +333,23 @@ def main():
            'epoch': 'baseline',
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
-        }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_baseline.tar'))
+        }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_baseline.tar'))
         
-    for epoch in range(args.start_epoch, args.epochs):
-        if not args.constant_lr and args.optim.lower() == "sgd":
-            adjust_learning_rate(optimizer, epoch)
 
-        # train for one epoch
+    if not args.constant_lr and args.optim.lower() == "sgd":
+        #scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+        scheduler = ReduceLROnPlateau(optimizer, 'min')
+
+    for epoch in range(args.start_epoch, args.epochs):
+
         if args.collect_activations:
             layer_activations.clear()
 
+        # train for one epoch
         prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch)        
 
         # evaluate on validation set
         prec1, loss_val = validate(val_loader, model, criterion, epoch)
-
-        if epoch >= epoch_interval  and epoch%10 == epoch_interval:
-            if args.collect_activations:
-                plot_AS(epoch)
-            if args.stiffness:
-                plot_stiffness(epoch)
-
         # append loss and prec1 values
         acc_train_list.append(prec1_train)
         acc_val_list.append(prec1)
@@ -321,6 +362,13 @@ def main():
 
         prev_prec = prec1
         best_prec1 = max(prec1, best_prec1)
+        print(' * Best-Prec@1 {top1:.3f}'.format(top1=best_prec1))
+
+        if epoch >= epoch_interval  and epoch%10 == epoch_interval:
+            if args.collect_activations:
+                plot_AS(epoch)
+            if args.stiffness:
+                plot_stiffness(epoch)
 
         if args.collect_cosine:
             if is_best:
@@ -331,21 +379,25 @@ def main():
                     print("    {0}:".format(p_key), distances[idx])
                 distances_list[idx].append(distances[idx])
 
-        if is_best_prev:
+
+        if is_best or epoch%5==0:
            save_checkpoint({
                'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(args.save_dir, 'checkpoint_{}.tar'.format(epoch)))
+            }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_{}.tar'.format(epoch)))
         
         if args.patiance != 0:
             early_stopping(loss_val, model)
             if early_stopping.early_stop == True:
                 break
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    plot_train_val_accs(acc_train_list, acc_val_list, timestamp)
-    plot_loss(loss_train_list, loss_val_list, timestamp)
+        if not args.constant_lr and args.optim.lower() == "sgd":
+            scheduler.step(loss_val)
+
+    #timestamp = time.strftime("%Y%m%d-%H%M%S")
+    plot_train_val_accs(acc_train_list, acc_val_list, best_prec1, accuracy_save_dir)
+    plot_loss(loss_train_list, loss_val_list, best_prec1, loss_save_dir)
 
     if args.collect_cosine:
         plot_cosine_distances(param_keys, distances_list, timestamp)
@@ -356,12 +408,15 @@ def train(train_loader, model, criterion, optimizer, epoch):
         Run one train epoch
     """
 
-    global AS_val, epoch_interval, stiffness_data_size
+    global AS_val, epoch_interval
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
+    
+    # switch to train mode
+    model.train()
 
     should_update = epoch%epoch_interval == 0 # and epoch >= epoch_interval
     
@@ -369,11 +424,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         enable_hooks()
         add_hooks(model)
 
-    # switch to train mode
-    model.train()
-
     end = time.time()
-
     for i, (input, target) in enumerate(train_loader):
 
         # measure data loading time
@@ -382,41 +433,57 @@ def train(train_loader, model, criterion, optimizer, epoch):
         if args.cpu == False:
             input = input.cuda(async=True)
             target = target.cuda(async=True)
+
         if args.half:
             input = input.half()
 
-        # compute output
-        optimizer.zero_grad()
-
-        if args.stiffness and args.batch_size*(i+1) >= stiffness_data_size  and should_update:
+        if args.stiffness and args.batch_size*(i+1) >= args.stiffness_size  and should_update:
             disable_hooks()
             remove_hooks(model)
 
-        output = model(input)
+        optimizer.zero_grad()
+
+        # compute output
+        #if args.jacobian_penalty:
+            #input.requires_grad_(True)
+        if args.jacobian_penalty:
+            output, jacobian = model(input)
+        else:
+            output = model(input)
         
-        if args.kl:
+        if args.noise_penalty:
+            noisy_input = add_gaussian_noise(input)
+            noisy_output = model(noisy_input)
+        
+        if args.kl and not args.noise_loss:
             ## Required conversions for KL loss.
             output_logp = F.log_softmax(output, dim=1)
             one_hot_target = convert_to_one_hot(target, 10).cuda().float()
             loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
 
         else:
-            ## For CrossEntropy Loss
-            loss = criterion(output, target)
+            if args.jacobian_penalty:
+                loss = criterion(output, target, jacobian)
+            elif args.noise_penalty:
+                loss = criterion(output, target, noisy_output)
+            elif args.adaptive_decay:
+                loss = criterion(output, target, model)
+            else:
+                loss = criterion(output, target)
 
         # compute gradient
         loss.backward()
 
-        if args.stiffness and args.batch_size*(i+1) < stiffness_data_size and should_update:
-            update_stiffness(model, target, i)
-
-        #do SGD step
+        #do the step
         optimizer.step()
         # measure accuracy and record loss
-        output = output.float()
+        if isinstance(output, list):
+            output_ce = output[-1].float()
+        else:
+            output_ce = output.float()
         loss = loss.float()
         
-        prec1 = accuracy(output.data, target)[0]
+        prec1 = accuracy(output_ce.data, target)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
 
@@ -433,13 +500,17 @@ def train(train_loader, model, criterion, optimizer, epoch):
                       epoch, i, len(train_loader), batch_time=batch_time,
                       data_time=data_time, loss=losses, top1=top1))
 
+        if args.stiffness and args.batch_size*(i+1) < args.stiffness_size and should_update:
+            update_stiffness(model, target, i)
+
+
     return top1.avg, losses.avg
 
 def validate(val_loader, model, criterion, epoch):
     """
     Run evaluation
     """
-    global is_best, activation_data_size
+    global is_best, best_prec1
     
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -472,7 +543,15 @@ def validate(val_loader, model, criterion, epoch):
 
         # compute output
         with torch.no_grad():
-            output = model(input)
+            if args.jacobian_penalty:
+                output, jacobian = model(input)
+            else:
+                output = model(input)
+
+            if args.noise_penalty:
+                noisy_input = add_gaussian_noise(input)
+                noisy_output = model(noisy_input)
+        
             
             if args.kl:
                 ## Required conversions for KL loss.
@@ -481,13 +560,21 @@ def validate(val_loader, model, criterion, epoch):
                 loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
             
             else:
-                ## For CrossEntropy Loss
-                loss = criterion(output, target)
+                if args.jacobian_penalty:
+                    loss = criterion(output, target, jacobian)
+                elif args.noise_penalty:
+                    loss = criterion(output, target, noisy_output)
+                elif args.adaptive_decay:
+                    loss = criterion(output, target, model)
+                else:
+                    loss = criterion(output, target)
 
         if args.collect_activations:
-            if args.batch_size*(i+1) > activation_data_size: 
+            if args.batch_size*(i+1) > args.activation_size: 
                 disable_hooks()
                 remove_hooks(model)
+                if args.evaluate:
+                    break
             else:
                 if args.evaluate:
                     save_activations(args.act_dir, i)
@@ -502,11 +589,14 @@ def validate(val_loader, model, criterion, epoch):
                             class_indexes = (target.cpu().numpy() == c)
                             layer_activations[k][c].append(v_np[class_indexes])
 
-        output = output.float()
+        if isinstance(output, list):
+            output_ce = output[-1].float()
+        else:
+            output_ce = output.float()
         loss = loss.float()
 
         # measure accuracy and record loss
-        prec1 = accuracy(output.data, target)[0]
+        prec1 = accuracy(output_ce.data, target)[0]
 
         #accumulate class activations
         if not args.evaluate and (args.collect_activations or args.stiffness): #and epoch==epoch_interval):
@@ -535,7 +625,7 @@ def validate(val_loader, model, criterion, epoch):
             print('Test: [{0}/{1}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'.format(
                       i, len(val_loader), batch_time=batch_time, loss=losses,
                       top1=top1))
 
@@ -568,11 +658,11 @@ def adjust_learning_rate(optimizer, epoch):
     if epoch == 0:
         return
     if args.resume and args.assert_lr:
-        #lr = args.lr * (0.5 ** ((epoch - args.start_epoch) // 30))  
-        lr = args.lr / np.sqrt(epoch - args.start_epoch)
+        lr = args.lr * (0.5 ** ((epoch - args.start_epoch) // 50))  
+        #lr = args.lr / np.sqrt(epoch - args.start_epoch)
     else:  
-        #lr = args.lr * (0.5 ** (epoch // 30))
-        lr = args.lr / np.sqrt(epoch)
+        lr = args.lr * (0.5 ** (epoch // 50))
+        #lr = args.lr / np.sqrt(epoch)
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -707,7 +797,7 @@ def update_AS(epoch):
                 stacked_c2 = np.vstack(c2_act)
 
                 
-                AS_avg_dict[name][c1, c2] = _get_RV_avg_pool(stacked_c1, stacked_c2, activation_data_size).item()
+                AS_avg_dict[name][c1, c2] = _get_RV_avg_pool(stacked_c1, stacked_c2, args.activation_size).item()
                 if c1 != c2:
                     AS_avg_dict[name][c2, c1] = AS_avg_dict[name][c1, c2]  
 
@@ -715,7 +805,7 @@ def update_AS(epoch):
                     bl_name = name + "_BASELINE"
                     if bl_name not in AS_avg_dict:
                         AS_avg_dict[bl_name] = torch.zeros([10, 10], dtype=torch.float32)
-                    AS_avg_dict[bl_name][c1, c2] = _get_RV_baseline(stacked_c1, stacked_c2, activation_data_size).item()
+                    AS_avg_dict[bl_name][c1, c2] = _get_RV_baseline(stacked_c1, stacked_c2, args.activation_size).item()
                     if c1 != c2:
                         AS_avg_dict[bl_name][c2, c1] = AS_avg_dict[bl_name][c1, c2]
 
@@ -741,7 +831,7 @@ def update_AS(epoch):
 
 def plot_AS(epoch):
     global stiffness_avg_dict
-    save_dir = 'figures/class_similarity/{0}'.format(args.arch)
+    save_dir = 'figures/class_similarity/{0}_{1}'.format(args.arch, args.optim)
 
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
@@ -809,13 +899,16 @@ def plot_cosine_distances(param_keys, distance_list, timestamp):
     save_dictionary_to_file(data_path, final_dict)
 
 
-def plot_train_val_accs(train_accs, val_accs, timestamp):
+def plot_train_val_accs(train_accs, val_accs, best_prec, save_dir):
     """  Plots training and validation accuarcy values in a single figure"""
 
-    save_path = "figures/acc/accs_per_epoch_a-{0}_{1}.png".format(args.arch, timestamp)
+    save_path = os.path.join(save_dir, "accuracy_{0}_{1}_{2:.3f}acc.png".format(args.arch, args.optim, best_prec))
     
     plt.figure()
-    plt.grid()
+    plt.grid(True, which='both')
+    plt.minorticks_on()
+    plt.ylim((0,100))
+    
     title = "Acurracy"
     epoch_axis = np.arange(len(train_accs))
     if args.resume:
@@ -837,13 +930,15 @@ def plot_train_val_accs(train_accs, val_accs, timestamp):
     plt.savefig(save_path)
     plt.clf()
 
-def plot_loss(train_loss, val_loss, timestamp):
+def plot_loss(train_loss, val_loss, best_prec, save_dir):
     """  Plots training and validation loss history in a single figure"""
 
-    save_path = "figures/loss/loss_per_epoch_a-{0}_{1}.png".format(args.arch, timestamp)
-    data_path = "data/loss_history/loss_per_epoch_a-{0}_{1}.npy".format(args.arch, timestamp)
+    save_path = os.path.join(save_dir, "loss_{0}_{1}_{2:.3f}acc.png".format(args.arch, args.optim, best_prec))
+    #data_path = "data/loss_history/loss_per_epoch_a-{0}_{1}_{2}.npy".format(args.arch, args.optim, timestamp)
     
     plt.figure()
+    plt.grid(True, which='both')
+    plt.minorticks_on()
     title = "Loss"
     epoch_axis = np.arange(len(train_loss))
     if args.resume:
@@ -862,11 +957,12 @@ def plot_loss(train_loss, val_loss, timestamp):
     plt.title(title)
     plt.savefig(save_path)
     plt.clf()
-
+    """
     final_dict = vars(args)
     final_dict["train_loss"] = train_loss
     final_dict["val_loss"] = val_loss
     save_dictionary_to_file(data_path, final_dict)
+    """
 
 if __name__ == '__main__':
     main()

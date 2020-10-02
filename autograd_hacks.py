@@ -31,7 +31,7 @@ import torch.nn.functional as F
 import numpy as np
 
 _supported_layers = ['Linear', 'Conv2d']  # Supported layer class types
-_activation_layers = ["BatchNorm2d"]
+#_activation_layers = ["ReLU"]
 _hooks_disabled: bool = False           # work-around for https://github.com/pytorch/pytorch/issues/25723
 
 _forward_handles = []
@@ -57,16 +57,22 @@ def add_hooks(model: nn.Module, grad1: bool = True) -> None:
     global _hooks_disabled, _forward_handles, _backward_handles
     _hooks_disabled = False
 
+    (last_name, last_layer) = list(model.named_modules())[-1]
     for name, layer in model.named_modules():
-        if is_module_supported(name, layer):
-            # partial to assign the layer name to each hook
-
-            if grad1:
+        if grad1:
+            if is_module_supported(name, layer):
+                # partial to assign the layer name to each hook
                 _forward_handles.append(layer.register_forward_hook(partial(_capture_activations_before_layer, name)))
                 _backward_handles.append(layer.register_backward_hook(partial(_capture_backprops, name)))
 
-            else:
+        else:
+            if is_module_supported_activation(name, layer):
+                #print("HOOK installed on", name)
                 _forward_handles.append(layer.register_forward_hook(partial(_capture_activations_after_layer, name)))
+            if (name, layer) == (last_name, last_layer):
+                #print("HOOK installed on", name)
+                _forward_handles.append(layer.register_forward_hook(partial(_capture_final_activations, name)))
+
 
 def remove_hooks(model: nn.Module) -> None:
     """
@@ -89,7 +95,6 @@ def remove_hooks(model: nn.Module) -> None:
     _backprops.clear()
     #del model.autograd_hacks_hooks
 
-
 def disable_hooks() -> None:
     """
     Globally disable all hooks installed by this library.
@@ -109,15 +114,24 @@ def is_supported(layer: nn.Module) -> bool:
     """Check if this layer is supported"""
     return _layer_type(layer) in _supported_layers
 
+def is_supported_activation(layer: nn.Module) -> bool:
+    """Check if this layer is supported"""
+    return isinstance(layer, nn.ReLU)
+
 
 def is_module_supported(name, layer):
     """Check if this layer is included"""
 
     return is_supported(layer)
 
+def is_module_supported_activation(name, layer):
+    """Check if this layer is included"""
+
+    return is_supported_activation(layer)
+
+
 def _layer_type(layer: nn.Module) -> str:
     return layer.__class__.__name__
-
 
 def _capture_activations_before_layer(name, layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
     """Save activations into layer.activations in forward pass"""
@@ -134,11 +148,22 @@ def _capture_activations_after_layer(name, layer: nn.Module, input: List[torch.T
 
     if _hooks_disabled:
         return
-    assert _layer_type(layer) in _activation_layers, "Hook installed on unsupported layer, this shouldn't happen"
+    #assert _layer_type(layer) in _activation_layers, "Hook installed on unsupported layer, this shouldn't happen"
+    assert isinstance(layer, nn.ReLU), "Hook installed on unsupported layer, this shouldn't happen"
     
     #setattr(layer, "activations", input[0].detach().cpu())
     _activations[name] = output.detach().cpu() #output.detach().cpu()
 
+def _capture_final_activations(name, layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
+    """Save activations into layer.activations in forward pass"""
+
+    if _hooks_disabled:
+        return
+    
+    assert _layer_type(layer) == "Linear", "Hook installed on unsupported layer, this shouldn't happen"
+    
+    #setattr(layer, "activations", input[0].detach().cpu())
+    _activations[name] = F.softmax(output, dim=1).detach().cpu() #output.detach().cpu()
 
 def _capture_backprops(name, layer: nn.Module, _input, output):
     """Append backprop to layer.backprops_list in backward pass."""

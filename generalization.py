@@ -36,7 +36,7 @@ def plot_helper(arch1, arch2, epoch1, epoch2, data_arch1, data_arch2):
         big_list_x += (idx*np.ones((len(y),))).tolist()
         big_list_y += y
     
-    plt.scatter(big_list_x, big_list_y, label="{} e-{}".format(arch1, epoch1), c='r')
+    plt.scatter(big_list_x, big_list_y, label="{} epoch {}".format(arch1, epoch1), c='r')
 
     big_list_x = []
     big_list_y = []
@@ -44,17 +44,17 @@ def plot_helper(arch1, arch2, epoch1, epoch2, data_arch1, data_arch2):
         big_list_x += (idx*np.ones((len(y),))).tolist()
         big_list_y += y
         
-    plt.scatter(big_list_x, big_list_y, label="{} e-{}".format(arch2, epoch2), c='b')
+    plt.scatter(big_list_x, big_list_y, label="{} epoch {}".format(arch2, epoch2), c='b')
     plt.legend()
     plt.xlabel("Layer ID")
-    plt.ylabel("Alpha")
+    plt.ylabel("lognorm")
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    plt.savefig("figures/lognorm/alpha_{}-e{}_{}-e{}_{}".format(arch1, epoch1, arch2, epoch2, timestamp))
+    plt.savefig("figures/lognorm/lognorm_{}-e{}_{}-e{}_{}".format(arch1, epoch1, arch2, epoch2, timestamp))
 
 
 def get_lognorm_per_layer(arch, epoch):
-    model = models.__dict__[arch]()
+    model = models.__dict__[arch](10)
     
     #if "vgg" in arch.lower():
     #    model.features = torch.nn.DataParallel(model.features)
@@ -75,15 +75,15 @@ def get_lognorm_per_layer(arch, epoch):
     
     for layer_id, result in results.items():
         for slice_id, summary in result.items():
-            if not str(slice_id).isdigit() or "alpha_weighted" not in summary:
+            if not str(slice_id).isdigit() or "lognorm" not in summary:
                 continue
             
-            #lognorm = summary["lognorm"]
-            alpha_weighted = summary["alpha_weighted"]
-            data_per_layer[layer_id].append(alpha_weighted)
+            lognorm = summary["lognorm"]
+            #alpha_weighted = summary["alpha_weighted"]
+            data_per_layer[layer_id].append(lognorm)
             
 
-            print("Layer {}, Slice {}: Alpha: {}".format(layer_id, slice_id, alpha_weighted))
+            print("Layer {}, Slice {}: Alpha: {}".format(layer_id, slice_id, lognorm))
 
     return data_per_layer
 
