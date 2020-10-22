@@ -49,10 +49,10 @@ class VGGJacobian(nn.Module):
         self.seed = seed
         self.init_weights(self.seed)
     
-    def init_weights(self, seed)
+    def init_weights(self, seed):
         for m in self.modules():
-        if isinstance(m, Conv2dWithJacobian):
-            m.init_weights(seed)
+            if isinstance(m, Conv2dWithJacobian):
+                m.init_weights(seed)
             
     def forward(self, x):
         din = torch.ones( x.size(), requires_grad=False ).to(x.device)
@@ -134,7 +134,7 @@ class VGG(nn.Module):
     '''
     VGG model
     '''
-    def __init__(self, features, width=64, num_classes=10, dropout=True):
+    def __init__(self, features, width=64, num_classes=10, dropout=True, seed=None):
         super(VGG, self).__init__()
         self.features = features
         self.width = int(512 * (width/64.0))

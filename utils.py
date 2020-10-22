@@ -5,6 +5,11 @@ from torch.autograd import Variable
 import numpy as np
 import pickle
 
+import torch.utils.data
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+
+
 """
 class JacobianRegularizerCrossEntropyLoss:
     def __init__(self, reduction="mean", alpha=5e-2):
@@ -36,18 +41,18 @@ class JacobianRegularizerCrossEntropyLoss:
 
     def __call__(self, output, target, jacobian=None):
         ce_loss = self.cross_entropy(output, target)
-        
+
         if jacobian == None:
             return ce_loss
-        
+
         jacobian_loss = 0.0
         for idx, out in enumerate(jacobian):
             penalty_ratio = self._lambda ** (len(jacobian)-idx-1)
-            
+
             loss = (jacobian[idx] ** 2).sum(dim=[i for i in range(1, len(jacobian[idx].shape))]).mean()
             jacobian_loss += penalty_ratio * loss
-            
-        return ce_loss + 0.5 * self.alpha * jacobian_loss 
+
+        return ce_loss + 0.5 * self.alpha * jacobian_loss
 
     def cuda(self,):
         self.cross_entropy.cuda()
@@ -59,38 +64,53 @@ class JacobianRegularizerCrossEntropyLoss:
         self.is_cuda = False
         return self
 
-class NoiseSensitivityCrossEntropyLoss:
-    def __init__(self, reduction="mean", alpha=5e-2, sim_loss="mse", _lambda=0.95):
-        
+class TransformSensitivityCrossEntropyLoss:
+    def __init__(self, reduction="mean", alpha=5e-2, sim_loss="cosine", _lambda=0.95, block=False, strength="decrease"):
+
         assert sim_loss.lower() in ["mse", "cosine"], "{} is an undefined metric. Choose from ('mse', 'cosine')".format(sim_loss.lower())
-        
+        assert strength.lower() in ["increase", "decrease", "constant", "increase_exp"]
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
         self.is_cuda = False
         self.alpha = alpha
-        self._lambda
+        self._lambda = _lambda
+        self.block = block
         self.sim_loss = sim_loss.lower()
+        self.strength = strength.lower()
 
     def __call__(self, output, target, noisy_output=None):
         ce_loss = self.cross_entropy(output[-1], target)
-        
+
         if noisy_output == None:
             return ce_loss
-        
+
         noise_sensitivity_loss = 0.0
         for idx, out in enumerate(output):
-            penalty_ratio = self._lambda ** (len(output)-idx-1)
+            if (idx%5 or idx==0) and self.block:
+                continue
+            if self.strength == "increase":
+                penalty_ratio = (idx//5 + 1) / len(output)
+            elif self.strength == "decrease":
+                penalty_ratio = 1 / (idx//5 + 1)
+            elif self.strength == "constant":
+                penalty_ratio = 1
+            elif self.strength == "increase_exp":
+                penalty_ratio = self._lambda ** (len(output)-idx-1)
+
             if self.sim_loss == "mse":
                 sum_dims = [i+1 for i in range(len(out.shape)-1)]
                 loss = F.mse_loss(out, noisy_output[idx] ,reduction='none').sum(dim=sum_dims)
                 loss /= torch.norm(out.flatten(start_dim=1), dim=1)**2
                 noise_sensitivity_loss += penalty_ratio * loss.mean()
             elif self.sim_loss == "cosine":
-                cosine_target = torch.ones((out.size(0),))
+                cosine_target = torch.ones((out.size(0),)).to(out.device)
                 if self.is_cuda:
                     cosine_target.cuda()
-                noise_sensitivity_loss += penalty_ratio * F.cosine_embedding_loss(out, noisy_output, cosine_target)         
-            
-        return ce_loss + self.alpha * noise_sensitivity_loss 
+                noise_sensitivity_loss += penalty_ratio * F.cosine_embedding_loss(out.view((out.shape[0], -1)),
+                                                                noisy_output[idx].view((out.shape[0], -1)),
+                                                                cosine_target
+                                                                )
+
+        return ce_loss + self.alpha * noise_sensitivity_loss
 
     def cuda(self,):
         self.cross_entropy.cuda()
@@ -112,7 +132,7 @@ class AdaptiveDecayCrossEntropyLoss:
 
     def __call__(self, output, target, model=None):
         ce_loss = self.cross_entropy(output, target)
-        
+
         if model == None:
             return ce_loss
 
@@ -134,7 +154,7 @@ class AdaptiveDecayCrossEntropyLoss:
                     else:
                         prev_jacob = p.mean(dim=(2,3))
                     norm_loss += adaptive_ratio * (prev_jacob**2).sum()
-            # If lambda is 0, adaptive decay defaults to standart weight decay 
+            # If lambda is 0, adaptive decay defaults to standart weight decay
             else:
                 norm_loss += (p**2).sum()
 
@@ -150,6 +170,32 @@ class AdaptiveDecayCrossEntropyLoss:
         self.is_cuda = False
         return self
 
+def regularize_spectral_norm(model, v_dict, alpha=0.001):
+    idx = sum([1 if hasattr(p, "weight") else 0 for (n,p) in model.named_parameters() ])
+    i = 0
+    for n, p in model.named_parameters():
+        if "bias" not in n:
+            penalty, new_v = power_iteration(p, v_dict[n])
+            #print(n, torch.norm(p.grad), torch.norm(alpha*penalty))
+            p.grad += alpha * penalty / (i//5 + 1)
+            v_dict[n] = new_v
+            i += 1
+
+def power_iteration(param, v):
+    param_copy = param.clone().detach()
+    if len(param.shape) > 2:
+        param_copy = torch.flatten(param_copy, start_dim=1)
+    param_copy = param_copy.t()
+    with torch.no_grad():
+        print(param.size(), param_copy.size(), v.size())
+        u = torch.mv(param_copy, v)
+        v = torch.mv(torch.transpose(param_copy, 0, 1), u)
+        eig = torch.norm(u) / torch.norm(v)
+        uv_t = torch.matmul(u.unsqueeze(1), v.unsqueeze(1).t()).t()
+        if len(param.shape) > 2:
+            uv_t = uv_t.view(param.size())
+    return eig * uv_t, v
+
 """
 class AdaptiveDecayCrossEntropyLoss:
     def __init__(self, reduction="mean", alpha=1e-3, _lambda = 0.5):
@@ -160,7 +206,7 @@ class AdaptiveDecayCrossEntropyLoss:
 
     def __call__(self, output, target, model=None):
         ce_loss = self.cross_entropy(output, target)
-        
+
         if model == None:
             return ce_loss
 
@@ -184,7 +230,7 @@ class AdaptiveDecayCrossEntropyLoss:
                     prev_jacob = F.conv2d(torch.ones((1,3,32,32)).to(p.device), p, padding=1).squeeze(0)
                 norm_loss += adaptive_ratio * ((prev_jacob*prev_jacob).sum()**0.5)
                 idx -= 1
-            # If lambda is 0, adaptive decay defaults to standart weight decay 
+            # If lambda is 0, adaptive decay defaults to standart weight decay
             else:
                 norm_loss += (p*p).sum()
 
@@ -239,19 +285,15 @@ class AddGaussianNoise(object):
     def __init__(self, mean=0., std=0.1):
         self.std = std
         self.mean = mean
-        
+
     def __call__(self, tensor):
         std_in_ratio = torch.norm(tensor, dim=(1,2), keepdim=True) * self.std
         return tensor + torch.randn(tensor.size()).to(std_in_ratio.device) * std_in_ratio  + self.mean
         #std_in_ratio = torch.norm(tensor) * self.std
         #return tensor + torch.randn(tensor.size()) * std_in_ratio  + self.mean
-    
+
     def __repr__(self):
         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
-
-def add_gaussian_noise(tensor, mean = 0.0, std=0.1):
-    std_in_ratio = torch.norm(tensor, dim=(2,3), keepdim=True) * std
-    return tensor + torch.randn(tensor.size()).to(std_in_ratio.device) * std_in_ratio  + mean
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -261,7 +303,7 @@ class AverageMeter(object):
 
     def reset(self, initial = 0):
         if self.keep_val:
-            self.val = initial    
+            self.val = initial
         else:
             self.val = 0
         self.avg = initial
@@ -270,7 +312,7 @@ class AverageMeter(object):
     def update(self, val, n=1):
         if self.keep_val:
             self.val = val
-        
+
         self.avg = self.avg*self.count + val*n
         self.count += n
         self.avg = self.avg/self.count
@@ -282,6 +324,112 @@ class AverageMeter(object):
         self.avg[self.avg<0.1] = 0.0
         self.avg[self.avg>0.1] = 1.0
         self.avg = F.softmax(self.avg, dim=1)
+
+def get_train_loader_CIFAR10(batch_size, workers, label_noise=False):
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
+    _transforms = transforms.Compose([
+                   transforms.RandomHorizontalFlip(),
+                   transforms.RandomCrop(32, 4),
+                   transforms.ToTensor(),
+                   normalize,
+               ])
+
+    train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
+
+    if label_noise > 0:
+        set_size = len(train_set.targets)
+        percentage = label_noise + label_noise/9.0
+        random_indexes = np.random.choice(set_size, int(set_size*percentage/100.0), replace=False)
+        random_labels = np.random.choice(10, len(random_indexes), replace=True)
+        i = 0
+        for idx in random_indexes:
+            train_set.targets[idx] = random_labels[i]
+            i += 1
+
+    train_sampler = None
+    train_loader = torch.utils.data.DataLoader(
+        train_set, batch_size=batch_size, shuffle=(train_sampler is None),
+        num_workers=workers, pin_memory=True, sampler=train_sampler)
+    return train_loader
+
+def get_val_loader_CIFAR10(batch_size, workers, noise_sigma):
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
+    if noise_sigma:
+        _transforms_val = transforms.Compose([
+                                transforms.ToTensor(),
+                                normalize,
+                                AddGaussianNoise(0., sigma),
+                            ])
+    else:
+        _transforms_val = transforms.Compose([
+                                transforms.ToTensor(),
+                                normalize,
+                            ])
+
+    val_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10(root='./data', train=False, transform=_transforms_val, download=True),
+                        batch_size=batch_size, shuffle=False,
+                        num_workers=workers, pin_memory=True)
+    return val_loader
+
+def get_train_loader_CIFAR100(batch_size, workers, label_noise=0):
+    mean = [0.5070751592371323, 0.48654887331495095, 0.4409178433670343]
+    std = [0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
+    transform_train = transforms.Compose([
+        #transforms.ToPILImage(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ])
+
+    train_set = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+
+    if label_noise > 0:
+        set_size = len(train_set.targets)
+        percentage = label_noise + label_noise/9.0
+        random_indexes = np.random.choice(set_size, int(set_size*percentage/100.0), replace=False)
+        random_labels = np.random.choice(10, len(random_indexes), replace=True)
+        i = 0
+        for idx in random_indexes:
+            train_set.targets[idx] = random_labels[i]
+            i += 1
+
+    train_sampler = None
+    train_loader = torch.utils.data.DataLoader(
+        train_set, batch_size=batch_size, shuffle=(train_sampler is None),
+        num_workers=workers, pin_memory=True, sampler=train_sampler)
+    return train_loader
+
+def get_val_loader_CIFAR100(batch_size, workers, noise_sigma=0):
+    mean = [0.5070751592371323, 0.48654887331495095, 0.4409178433670343]
+    std = [0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
+    if noise_sigma:
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            AddGaussianNoise(0., noise_sigma)
+        ])
+    else:
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std)
+        ])
+    val_set = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+    val_loader = torch.utils.data.DataLoader(
+        val_set, shuffle=False, num_workers=workers, batch_size=batch_size)
+    return val_loader
+
+
+def add_gaussian_noise(tensor, mean = 0.0, std=0.1):
+    std_in_ratio = torch.norm(tensor, dim=(2,3), keepdim=True) * std
+    return tensor + torch.randn(tensor.size()).to(std_in_ratio.device) * std_in_ratio  + mean
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -329,6 +477,3 @@ def threshold_gradient_stiffness(similarity, threshold=0.05, steepness=0.25):
     if similarity < threshold + 1e-5:
         return 1e-5
     return np.exp(((similarity-threshold)**2)/steepness)
-
-
-        

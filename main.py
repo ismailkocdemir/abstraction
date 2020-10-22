@@ -21,9 +21,9 @@ import torch.nn.functional as F
 import torch.optim
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 
-import torch.utils.data
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+#import torch.utils.data
+#import torchvision.transforms as transforms
+#import torchvision.datasets as datasets
 
 import models
 from autograd_hacks import *
@@ -54,7 +54,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='vgg19',
 parser.add_argument('--resnet-width', '--rw', default=64,
                     help='Resnet18 width. (default: 64)')
 parser.add_argument('--dataset', '--d', type=str, default='cifar10',
-                        help='dataset to train on.', choices=['cifar10', 'imagenet'])
+                        help='dataset to train on.', choices=['cifar10', 'cifar100'])
 
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -66,12 +66,14 @@ parser.add_argument('--seed', default=None, type=int,
 					help='seed for initializing the weights')
 
 ## OPTIMIZATION
+parser.add_argument("--spectral-regularization", "--snr", default=False, dest="snr",
+                    action="store_true", help="if provided, apply spectral norm regularization")
 parser.add_argument("--adaptive-decay", "--ad", default=False, dest="adaptive_decay",
                     action="store_true", help="if provided, apply adaptive weight decay")
 parser.add_argument("--single-layer", "--sl", default=False, dest="single_layer",
                     action="store_true", help="if provided, adaptive weight decay is not accumulated down the network")
-parser.add_argument("--noise-penalty", "--np", default=False, dest="noise_penalty",
-                    action="store_true", help="if provided, include noise sensitivity in the loss")
+parser.add_argument("--transform-penalty", "--tp", default=False, dest="transform_penalty",
+                    action="store_true", help="if provided, include random transformation sensitivity in the loss")
 parser.add_argument("--jacobian-penalty", "--jp", default=False, dest="jacobian_penalty",
                     action="store_true", help="if provided, include jacobian of each layer in the loss")
 parser.add_argument("--dropout", "--dr", default=False, dest="dropout",
@@ -137,6 +139,11 @@ parser.add_argument('-r', '--refer-initial', dest='refer_init', action='store_tr
                     help='Collect activations that compare to their checkpoint versions OR \
                     cosine distances that refer to initial random weights')
 
+parser.add_argument('--block',  dest='block', action='store_true',
+                    help='apply noise penalty to block instead of indivual layers')
+parser.add_argument('--strength', dest='strength', type=str, default='decrease',
+                    help='strength curve for regularization. choises: increase, decrease, increase_exp, constant',
+                    choices=["increase", "decrease", "constant", "increase_exp"])
 parser.add_argument('-l', '--label-noise', default=0, type=int,
                      help='\%of label noise in training set (default: 0\%)')
 parser.add_argument('--in', '--input-noise', dest='input_noise', action='store_true',
@@ -155,29 +162,20 @@ def main():
     global args, best_prec1, is_best, layer_activations, prev_prec
     args = parser.parse_args()
     dataset_choice = args.dataset.lower()
-    
-    if args.noise_penalty:
+
+    if args.transform_penalty:
         args.arch = "_".join([args.arch.split("_")[0] + "MO"] + args.arch.split("_")[1:])
     elif args.jacobian_penalty:
         args.arch = "_".join([args.arch.split("_")[0] + "Jacobian"] + args.arch.split("_")[1:])
 
     if dataset_choice == "cifar10":
         model = models.__dict__[args.arch](num_classes=10, dropout=args.dropout, seed=args.seed)
-    else:
-        model = models.__dict__[args.arch](num_classes=1000, dropout=args.dropout, seed=args.seed)
-
+    elif dataset_choice == "cifar100":
+        model = models.__dict__[args.arch](num_classes=100, dropout=args.dropout, seed=args.seed)
     if args.cpu:
         model.cpu()
     else:
         model.cuda()
-
-    '''
-    for n, m in model.named_parameters():
-        print(n, m.size())
-
-    print("=++++++++++++++++++++++++++++++++++++++++++++=")
-    sys.exit()
-    '''
 
     # Check the save_dir exists or not
     checkpoint_save_dir = os.path.join("checkpoints", args.save_dir)
@@ -199,96 +197,48 @@ def main():
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.evaluate, checkpoint['epoch']))
+                  .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
-
         '''
         if args.collect_cosine and not args.refer_init:
             model.update_reference_weights()
         '''
 
     cudnn.benchmark = True
-    
+
     if args.patiance != 0:
         early_stopping = EarlyStopping(patience=args.patiance, verbose=True)
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-
     if dataset_choice == 'cifar10':
+        train_loader = get_train_loader_CIFAR10(args.batch_size, args.workers, args.label_noise)
+        val_loader = get_val_loader_CIFAR10(args.batch_size, args.workers, args.sigma)
+    elif dataset_choice == "cifar100":
+        train_loader = get_train_loader_CIFAR100(args.batch_size, args.workers, args.label_noise)
+        val_loader = get_val_loader_CIFAR100(args.batch_size, args.workers, args.sigma)
 
-        _transforms = transforms.Compose([
-                        transforms.RandomHorizontalFlip(),
-                        transforms.RandomCrop(32, 4),
-                        transforms.ToTensor(),
-                        normalize,
-                    ])
 
-        if args.input_noise:
-            _transforms_val = transforms.Compose([
-                                    transforms.ToTensor(),
-                                    normalize,
-                                    AddGaussianNoise(0., args.sigma),
-                                ])
-        
-        else:    
-            _transforms_val = transforms.Compose([
-                                    transforms.ToTensor(),
-                                    normalize,
-                                ])
-
-        train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
-
-        val_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR10(root='./data', train=False, transform=_transforms_val, download=True),
-                            batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.workers, pin_memory=True)
-
-    else:
-        train_set = datasets.ImageNet(
-            root = './data', train=True,
-            transform = transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True)
-
-        val_loader = torch.utils.data.DataLoader(
-            datasets.ImageNet(root="./data", split='val',
-                trasform=trantransforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ]), download=True),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-
-    if args.label_noise > 0:
-        set_size = len(train_set.targets)
-        percentage = args.label_noise + args.label_noise/9.0
-        random_indexes = np.random.choice(set_size, int(set_size*percentage/100.0), replace=False)
-        random_labels = np.random.choice(10, len(random_indexes), replace=True)
-        i = 0
-        for idx in random_indexes:
-            train_set.targets[idx] = random_labels[i]
-            i += 1
-    
     # define loss function (criterion) and optimizer
     if args.kl:
         criterion = nn.KLDivLoss(reduction='batchmean')
     else:
         if args.jacobian_penalty:
             criterion = JacobianRegularizerCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda=args.lambd)
-        elif args.noise_penalty:
-            criterion = NoiseSensitivityCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda = args.lambd, sim_loss=args.sim_loss)
+        elif args.transform_penalty:
+            criterion = TransformSensitivityCrossEntropyLoss(reduction='mean',
+                                    alpha=args.alpha,
+                                    _lambda=args.lambd,
+                                    sim_loss=args.sim_loss,
+                                    block=args.block,
+                                    strength=args.strength)
         elif args.adaptive_decay:
-            criterion = AdaptiveDecayCrossEntropyLoss(reduction='mean', alpha=args.alpha, _lambda=args.lambd, single_layer=args.single_layer)
+            criterion = AdaptiveDecayCrossEntropyLoss(reduction='mean',
+                                    alpha=args.alpha,
+                                    _lambda=args.lambd,
+                                    single_layer=args.single_layer)
         else:
             criterion = nn.CrossEntropyLoss(reduction='mean')
-    
+
     if args.cpu:
         criterion = criterion.cpu()
     else:
@@ -302,12 +252,14 @@ def main():
         validate(val_loader, model, criterion, 0)
         return
 
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    v_dict = None
+    if args.snr:
+        v_dict = defaultdict()
+        for n,m in model.named_parameters():
+            if "bias" not in n:
+                v_dict[n] = torch.rand(m.size(0)).to(m.device)
 
-    if args.optim.lower() == "sgd": 
+    if args.optim.lower() == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -322,19 +274,18 @@ def main():
     if args.collect_cosine:
         param_keys = []
         distances_list = [[] for i in range(len(list(model.buffers())))]
-    
+
     acc_train_list = []
     acc_val_list = []
     loss_train_list = []
     loss_val_list = []
-    
+
     if args.start_epoch == 0:
        save_checkpoint({
            'epoch': 'baseline',
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
         }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_baseline.tar'))
-        
 
     if not args.constant_lr and args.optim.lower() == "sgd":
         #scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
@@ -346,7 +297,7 @@ def main():
             layer_activations.clear()
 
         # train for one epoch
-        prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch)        
+        prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch, v_dict)
 
         # evaluate on validation set
         prec1, loss_val = validate(val_loader, model, criterion, epoch)
@@ -386,7 +337,7 @@ def main():
                 'state_dict': model.state_dict(),
                 'best_prec1': best_prec1,
             }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_{}.tar'.format(epoch)))
-        
+
         if args.patiance != 0:
             early_stopping(loss_val, model)
             if early_stopping.early_stop == True:
@@ -403,7 +354,7 @@ def main():
         plot_cosine_distances(param_keys, distances_list, timestamp)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, v_dict):
     """
         Run one train epoch
     """
@@ -414,12 +365,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
-    
+
     # switch to train mode
     model.train()
 
     should_update = epoch%epoch_interval == 0 # and epoch >= epoch_interval
-    
+
     if args.stiffness and should_update:
         enable_hooks()
         add_hooks(model)
@@ -450,12 +401,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
             output, jacobian = model(input)
         else:
             output = model(input)
-        
-        if args.noise_penalty:
-            noisy_input = add_gaussian_noise(input)
+
+        if args.transform_penalty:
+            noisy_input = add_gaussian_noise(input, std=args.sigma)
             noisy_output = model(noisy_input)
-        
-        if args.kl and not args.noise_loss:
+
+        if args.kl and not args.transform_penalty:
             ## Required conversions for KL loss.
             output_logp = F.log_softmax(output, dim=1)
             one_hot_target = convert_to_one_hot(target, 10).cuda().float()
@@ -464,7 +415,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         else:
             if args.jacobian_penalty:
                 loss = criterion(output, target, jacobian)
-            elif args.noise_penalty:
+            elif args.transform_penalty:
                 loss = criterion(output, target, noisy_output)
             elif args.adaptive_decay:
                 loss = criterion(output, target, model)
@@ -474,6 +425,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # compute gradient
         loss.backward()
 
+        if args.snr:
+            regularize_spectral_norm(model, v_dict, args.alpha)
         #do the step
         optimizer.step()
         # measure accuracy and record loss
@@ -482,7 +435,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         else:
             output_ce = output.float()
         loss = loss.float()
-        
+
         prec1 = accuracy(output_ce.data, target)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
@@ -511,7 +464,7 @@ def validate(val_loader, model, criterion, epoch):
     Run evaluation
     """
     global is_best, best_prec1
-    
+
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -522,7 +475,7 @@ def validate(val_loader, model, criterion, epoch):
     end = time.time()
 
     should_update = epoch%epoch_interval == 0
-    
+
     if args.collect_activations:
         if args.evaluate or should_update:
             enable_hooks()
@@ -548,21 +501,21 @@ def validate(val_loader, model, criterion, epoch):
             else:
                 output = model(input)
 
-            if args.noise_penalty:
+            if args.transform_penalty:
                 noisy_input = add_gaussian_noise(input)
                 noisy_output = model(noisy_input)
-        
-            
+
+
             if args.kl:
                 ## Required conversions for KL loss.
                 output_logp = F.log_softmax(output, dim=1)
                 one_hot_target = convert_to_one_hot(target, 10).cuda().float()
                 loss = criterion(output_logp.cuda(async=True), one_hot_target.cuda(async=True))
-            
+
             else:
                 if args.jacobian_penalty:
                     loss = criterion(output, target, jacobian)
-                elif args.noise_penalty:
+                elif args.transform_penalty:
                     loss = criterion(output, target, noisy_output)
                 elif args.adaptive_decay:
                     loss = criterion(output, target, model)
@@ -570,7 +523,7 @@ def validate(val_loader, model, criterion, epoch):
                     loss = criterion(output, target)
 
         if args.collect_activations:
-            if args.batch_size*(i+1) > args.activation_size: 
+            if args.batch_size*(i+1) > args.activation_size:
                 disable_hooks()
                 remove_hooks(model)
                 if args.evaluate:
@@ -578,7 +531,7 @@ def validate(val_loader, model, criterion, epoch):
             else:
                 if args.evaluate:
                     save_activations(args.act_dir, i)
-                
+
                 elif should_update:
                     for k,v in get_activations().items():
                         if k not in layer_activations.keys():
@@ -604,7 +557,7 @@ def validate(val_loader, model, criterion, epoch):
             for c in range(10):
                 class_indices = target == c
                 x =  F.softmax(output[class_indices],dim=1)
-                
+
                 none_index = x!=x
                 nan = torch.sum(none_index, dim=1)
                 not_nan = nan == 0
@@ -636,7 +589,7 @@ def validate(val_loader, model, criterion, epoch):
         final_activations_per_class = final_activations_per_class/acc
         plt.clf()
         ax0 = sns.heatmap(final_activations_per_class.cpu().numpy(), vmin=0.0, vmax=1.0, square=True, annot=True, fmt=".2f")
-        
+
         save_dir = "figures/class_accuracy/{}/".format(args.arch)
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -658,9 +611,9 @@ def adjust_learning_rate(optimizer, epoch):
     if epoch == 0:
         return
     if args.resume and args.assert_lr:
-        lr = args.lr * (0.5 ** ((epoch - args.start_epoch) // 50))  
+        lr = args.lr * (0.5 ** ((epoch - args.start_epoch) // 50))
         #lr = args.lr / np.sqrt(epoch - args.start_epoch)
-    else:  
+    else:
         lr = args.lr * (0.5 ** (epoch // 50))
         #lr = args.lr / np.sqrt(epoch)
 
@@ -682,17 +635,17 @@ def update_stiffness(model, target, i):
 
             if name not in stiffness_avg_dict:
                 stiffness_avg_dict[name] = AverageMeter(torch.zeros([10, 10], dtype=torch.float32).cuda(), keep_val=False)
-        
+
             layer_class_sim = torch.zeros([10, 10], dtype=torch.float32).cuda()
             for c1 in range(10):
                 for c2 in range(c1,10):
                     try:
                         assert hasattr(param, 'grad1'), "{} has no attribute named 'grad1'".format(name)
-                        
-                        # Subtract the mean gradient vector calculated from all classes, 
+
+                        # Subtract the mean gradient vector calculated from all classes,
                         # hoping that this can help surpress the between-classes similarities and magnify
-                        # the in-class similarities. In the layers that have no class specific information, 
-                        # this should not change anything.                            
+                        # the in-class similarities. In the layers that have no class specific information,
+                        # this should not change anything.
                         if c1 == c2:
                             class_indices = (target == c1)
                             class_grads = param.grad1[class_indices].cuda()
@@ -712,8 +665,8 @@ def update_stiffness(model, target, i):
                             grads1 = class1_grads[:num_of_samples] #torch.flatten(class1_grads[:num_of_samples], start_dim=1)
                             grads2 = class2_grads[:num_of_samples] #torch.flatten(class2_grads[:num_of_samples], start_dim=1)
                             layer_class_sim[c1,c2] = layer_class_sim[c2,c1] = calculate_batch_stiffness(grads1, grads2)
-                            
-                        
+
+
                     except Exception as e:
                         if type(e) != AssertionError:
                             print(e)
@@ -724,9 +677,9 @@ def update_stiffness(model, target, i):
             if name in stiffness_avg_dict:
                 stiffness_avg_dict[name].update(layer_class_sim)
 
-                avg_key = None        
+                avg_key = None
                 sub_name, indx, _ = name.split(".")
-                if sub_name == "features": 
+                if sub_name == "features":
                     if int(indx) < 25:
                         avg_key = "early_conv_avg"
                     elif int(indx) >= 40:
@@ -758,7 +711,7 @@ def calculate_batch_stiffness(grads1, grads2):
     grads2 = grads2.view(grads2.size(0),-1)
     grads2_c = grads2 - grads2.mean(dim=1).unsqueeze(1)
     grads2_n = grads2_c / (1e-8 + torch.sqrt(torch.sum(grads2_c**2, dim=1))).unsqueeze(1)
-    
+
     R = grads1_n.matmul(grads2_n.transpose(1,0)).clamp(-1,1)
     R[R<0] = 0
 
@@ -796,10 +749,10 @@ def update_AS(epoch):
                 stacked_c1 = np.vstack(c1_act)
                 stacked_c2 = np.vstack(c2_act)
 
-                
+
                 AS_avg_dict[name][c1, c2] = _get_RV_avg_pool(stacked_c1, stacked_c2, args.activation_size).item()
                 if c1 != c2:
-                    AS_avg_dict[name][c2, c1] = AS_avg_dict[name][c1, c2]  
+                    AS_avg_dict[name][c2, c1] = AS_avg_dict[name][c1, c2]
 
                 if epoch == 0:
                     bl_name = name + "_BASELINE"
@@ -809,9 +762,9 @@ def update_AS(epoch):
                     if c1 != c2:
                         AS_avg_dict[bl_name][c2, c1] = AS_avg_dict[bl_name][c1, c2]
 
-            avg_key = None        
+            avg_key = None
             sub_name, indx = name.split(".")
-            if sub_name == "features": 
+            if sub_name == "features":
                 if int(indx) < 25:
                     avg_key = "early_conv_avg"
                 elif int(indx) >= 40:
@@ -827,7 +780,7 @@ def update_AS(epoch):
     AS_avg_dict["early_conv_avg"] = AS_avg_dict["early_conv_avg"].get_average()
 
     layer_activations.clear()
-    
+
 
 def plot_AS(epoch):
     global stiffness_avg_dict
@@ -861,7 +814,7 @@ def plot_cosine_distances(param_keys, distance_list, timestamp):
     plt.rc('axes', prop_cycle=default_cycler)
 
     '''
-    
+
     c = np.arange(1, len(param_keys) + 1)
     epoch_axis = np.arange(len(distance_list[0]))
 
@@ -876,7 +829,7 @@ def plot_cosine_distances(param_keys, distance_list, timestamp):
             title += ", Re-randomized"
 
     if args.constant_lr:
-        title += ", Constant Learning Rate" 
+        title += ", Constant Learning Rate"
 
     norm = mpl.colors.Normalize(vmin=c.min(), vmax=c.max())
     cmap = mpl.cm.ScalarMappable(norm=norm, cmap=mpl.cm.inferno)
@@ -903,12 +856,12 @@ def plot_train_val_accs(train_accs, val_accs, best_prec, save_dir):
     """  Plots training and validation accuarcy values in a single figure"""
 
     save_path = os.path.join(save_dir, "accuracy_{0}_{1}_{2:.3f}acc.png".format(args.arch, args.optim, best_prec))
-    
+
     plt.figure()
     plt.grid(True, which='both')
     plt.minorticks_on()
     plt.ylim((0,100))
-    
+
     title = "Acurracy"
     epoch_axis = np.arange(len(train_accs))
     if args.resume:
@@ -919,7 +872,7 @@ def plot_train_val_accs(train_accs, val_accs, best_prec, save_dir):
             title += ", Re-randomized"
 
     if args.constant_lr:
-        title += ", Constant learning rate" 
+        title += ", Constant learning rate"
 
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy (%)")
@@ -935,7 +888,7 @@ def plot_loss(train_loss, val_loss, best_prec, save_dir):
 
     save_path = os.path.join(save_dir, "loss_{0}_{1}_{2:.3f}acc.png".format(args.arch, args.optim, best_prec))
     #data_path = "data/loss_history/loss_per_epoch_a-{0}_{1}_{2}.npy".format(args.arch, args.optim, timestamp)
-    
+
     plt.figure()
     plt.grid(True, which='both')
     plt.minorticks_on()
@@ -949,7 +902,7 @@ def plot_loss(train_loss, val_loss, best_prec, save_dir):
             title += ", Re-randomized"
 
     if args.constant_lr:
-        title += ", Constant learning rate" 
+        title += ", Constant learning rate"
 
     plt.plot(epoch_axis, train_loss, label='train_loss')
     plt.plot(epoch_axis, val_loss, label='val_loss')
