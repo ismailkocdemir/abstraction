@@ -1,2 +1,4 @@
 # abstraction
-Abstraction in ANNs
+Some tools for analysis and comparison of  the learned representations in deep networks by a bunch of methods using information theoretic and spectral analysis.
+
+We are trying to quantify abstractness of a representationa and understand how it evolves trough the layers. 
