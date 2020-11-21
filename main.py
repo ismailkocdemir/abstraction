@@ -4,8 +4,9 @@ import shutil
 import time
 import sys
 import collections
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 from functools import partial
+import json
 
 from cycler import cycler
 import numpy as np
@@ -14,12 +15,15 @@ import matplotlib as mpl
 import seaborn as sns
 
 import torch
+import torchvision
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.optim
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
+
+from torch.utils.tensorboard import SummaryWriter
 
 #import torch.utils.data
 #import torchvision.transforms as transforms
@@ -35,14 +39,13 @@ model_names = sorted(name for name in models.__dict__
                      and callable(models.__dict__[name]))
 
 stiffness_avg_dict = defaultdict()
-epoch_interval = 5
 AS_avg_dict = defaultdict()
-
-is_best = False
-
 layer_activations = defaultdict()
 layer_gradients = defaultdict()
+writer = None
 
+is_best = False
+epoch_interval = 5
 best_prec1 = 0
 prev_prec = 0
 
@@ -51,66 +54,71 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='vgg19',
                     choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) +
                     ' (default: vgg19)')
-parser.add_argument('--resnet-width', '--rw', default=64,
-                    help='Resnet18 width. (default: 64)')
 parser.add_argument('--dataset', '--d', type=str, default='cifar10',
                         help='dataset to train on.', choices=['cifar10', 'cifar100'])
+parser.add_argument('--resize', '--rs', type=int, default=None,
+                        help='image size to resize to')
+
 
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=64, type=int,
-                    metavar='N', help='mini-batch size (default: 64)')
+parser.add_argument('-b', '--batch-size', default=32, type=int,
+                    metavar='N', help='mini-batch size (default: 32)')
 parser.add_argument('--seed', default=None, type=int,
 					help='seed for initializing the weights')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
 
 ## OPTIMIZATION
+parser.add_argument('-o', '--optimizer', dest="optim", default="SGD",
+                    type=str, help="Optimizer. Options: SGD, Adam")
 parser.add_argument("--spectral-regularization", "--snr", default=False, dest="snr",
                     action="store_true", help="if provided, apply spectral norm regularization")
 parser.add_argument("--adaptive-decay", "--ad", default=False, dest="adaptive_decay",
                     action="store_true", help="if provided, apply adaptive weight decay")
-parser.add_argument("--single-layer", "--sl", default=False, dest="single_layer",
-                    action="store_true", help="if provided, adaptive weight decay is not accumulated down the network")
 parser.add_argument("--transform-penalty", "--tp", default=False, dest="transform_penalty",
                     action="store_true", help="if provided, include random transformation sensitivity in the loss")
 parser.add_argument("--jacobian-penalty", "--jp", default=False, dest="jacobian_penalty",
                     action="store_true", help="if provided, include jacobian of each layer in the loss")
 parser.add_argument("--dropout", "--dr", default=False, dest="dropout",
                     action="store_true", help="if provided, apply dropout with default rate")
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
-parser.add_argument('-o', '--optimizer', dest="optim", default="SGD",
-                    type=str, help="Optimizer. Options: SGD, Adam")
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
-                    metavar='W', help='weight decay (default: 5e-4)')
+parser.add_argument('--weight-decay', '--wd', default=0, type=float,
+                    metavar='W', help='weight decay (default: 0), in general, it is set to 5e-4')
 parser.add_argument("--patiance", "--pt", default=0, type=int,
             help="Patiance value for early stopping. Default: 0 (No early stopping)")
-parser.add_argument('--print-freq', '-p', default=40, type=int,
-                    metavar='N', help='print frequency (default: 40)')
-parser.add_argument('--kl', dest='kl', action='store_true',
-                    help='use KL divergence as the objective')
 
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                    help='path to latest checkpoint (default: none)')
-parser.add_argument('--assert-lr', dest="assert_lr", action='store_true',
-                    help='Assert larger initial learning rate when resuming, as opposed to \
-                    checkpoint adjustment.')
-parser.add_argument('--constant-lr', dest="constant_lr", action='store_true',
-                    help='Constant learning rate.')
+parser.add_argument('--strength', dest='strength', type=str, default='decrease',
+                    help='strength curve for regularization. choices: increase, decrease, increase_exp, constant',
+                    choices=["increase", "decrease", "constant", "increase_exp"])
+parser.add_argument('--block',  dest='block', action='store_true',
+                    help='apply transform penalty to block instead of indivual layers')
+parser.add_argument("--single-layer", "--sl", default=False, dest="single_layer",
+                    action="store_true", help="if provided, adaptive weight decay is not accumulated down the network")
+parser.add_argument('--sigma', default=0.1, type=float,
+                     help='std. of the gaussian noise added to input')
+parser.add_argument('--alpha', default=1e-2, type=float,
+                     help='contribution ratio for regularizers')
+parser.add_argument('--sim-loss', dest='sim_loss',
+                    help="measures the distance between activations",
+                    default='mse', type=str)
+parser.add_argument('--lambd', default=0.5, type=float,
+                     help='adaptive ratio base for exponential strenght curve')
 
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
-                    help='evaluate model on validation set')
-parser.add_argument('--pretrained', dest='pretrained', action='store_true',
-                    help='use pre-trained model')
+
 parser.add_argument('--half', dest='half', action='store_true',
                     help='use half-precision(16-bit) ')
 parser.add_argument('--cpu', dest='cpu', action='store_true',
                     help='use cpu')
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
 
 parser.add_argument('--save-dir', dest='save_dir',
                     help='The directory used to save the trained models',
@@ -121,6 +129,25 @@ parser.add_argument('--activation-dir', dest='act_dir',
 parser.add_argument('--grad-dir', dest='grad_dir',
                     help='The directory used to save the layer gradients',
                     default='gradients', type=str)
+parser.add_argument('--resnet-width', '--rw', default=64,
+                    help='Resnet18 width. (default: 64)')
+parser.add_argument('--params', dest="params", action='store_true')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
+
+parser.add_argument('--print-freq', '-p', default=80, type=int,
+                    metavar='N', help='print frequency (default: 80)')
+parser.add_argument('--kl', dest='kl', action='store_true',
+                    help='use KL divergence as the objective')
+parser.add_argument('--assert-lr', dest="assert_lr", action='store_true',
+                    help='Assert larger initial learning rate when resuming, as opposed to \
+                    checkpoint adjustment.')
+parser.add_argument('--constant-lr', dest="constant_lr", action='store_true',
+                    help='Constant learning rate.')
+parser.add_argument('-l', '--label-noise', default=0, type=int,
+                     help='\%of label noise in training set (default: 0\%)')
+parser.add_argument('--in', '--input-noise', dest='input_noise', action='store_true',
+                    help='add gaussian noise to the input')
 
 parser.add_argument('--collect-cosine', dest='collect_cosine', action='store_true',
                     help='Collect cosine distances of weights to their initial versions')
@@ -139,27 +166,10 @@ parser.add_argument('-r', '--refer-initial', dest='refer_init', action='store_tr
                     help='Collect activations that compare to their checkpoint versions OR \
                     cosine distances that refer to initial random weights')
 
-parser.add_argument('--block',  dest='block', action='store_true',
-                    help='apply noise penalty to block instead of indivual layers')
-parser.add_argument('--strength', dest='strength', type=str, default='decrease',
-                    help='strength curve for regularization. choises: increase, decrease, increase_exp, constant',
-                    choices=["increase", "decrease", "constant", "increase_exp"])
-parser.add_argument('-l', '--label-noise', default=0, type=int,
-                     help='\%of label noise in training set (default: 0\%)')
-parser.add_argument('--in', '--input-noise', dest='input_noise', action='store_true',
-                    help='add gaussian noise to the input')
-parser.add_argument('--sigma', default=0.1, type=float,
-                     help='std. of the gaussian noise added to input')
-parser.add_argument('--lambd', default=0.5, type=float,
-                     help='adaptive ratio base')
-parser.add_argument('--alpha', default=5e-3, type=float,
-                     help='contribution ratio for regularizers')
-parser.add_argument('--sim-loss', dest='sim_loss',
-                    help="measures the distance between activations",
-                    default='mse', type=str)
+
 
 def main():
-    global args, best_prec1, is_best, layer_activations, prev_prec
+    global args, best_prec1, is_best, layer_activations, prev_prec, writer
     args = parser.parse_args()
     dataset_choice = args.dataset.lower()
 
@@ -177,10 +187,19 @@ def main():
     else:
         model.cuda()
 
+    if args.params:
+        for n,p in model.named_parameters():
+            print(n, p.size())
+        return
+
+    run_dir = os.path.join("runs", args.save_dir)
+    if os.path.exists(run_dir):
+        raise ValueError("Error: run already exists")
+
     # Check the save_dir exists or not
-    checkpoint_save_dir = os.path.join("checkpoints", args.save_dir)
-    accuracy_save_dir = os.path.join("figures/training_plots/accuracy", args.save_dir)
-    loss_save_dir = os.path.join("figures/training_plots/loss", args.save_dir)
+    checkpoint_save_dir = os.path.join(run_dir, "checkpoints")
+    accuracy_save_dir = os.path.join(run_dir, "training_plots")
+    loss_save_dir = os.path.join(run_dir, "training_plots")
     if not os.path.exists(checkpoint_save_dir):
         os.makedirs(checkpoint_save_dir)
     if not os.path.exists(accuracy_save_dir):
@@ -211,11 +230,25 @@ def main():
         early_stopping = EarlyStopping(patience=args.patiance, verbose=True)
 
     if dataset_choice == 'cifar10':
-        train_loader = get_train_loader_CIFAR10(args.batch_size, args.workers, args.label_noise)
-        val_loader = get_val_loader_CIFAR10(args.batch_size, args.workers, args.sigma)
+        train_loader = get_train_loader_CIFAR10(args.batch_size,
+                                                args.workers,
+                                                args.label_noise,
+                                                args.resize
+                                            )
+        val_loader = get_val_loader_CIFAR10(args.batch_size,
+                                            args.workers,
+                                            args.resize
+                                        )
     elif dataset_choice == "cifar100":
-        train_loader = get_train_loader_CIFAR100(args.batch_size, args.workers, args.label_noise)
-        val_loader = get_val_loader_CIFAR100(args.batch_size, args.workers, args.sigma)
+        train_loader = get_train_loader_CIFAR100(args.batch_size,
+                                                args.workers,
+                                                args.label_noise,
+                                                args.resize
+                                            )
+        val_loader = get_val_loader_CIFAR100(args.batch_size,
+                                            args.workers,
+                                            args.resize
+                                        )
 
 
     # define loss function (criterion) and optimizer
@@ -252,12 +285,27 @@ def main():
         validate(val_loader, model, criterion, 0)
         return
 
+    writer = SummaryWriter(run_dir)
+    with open(os.path.join(run_dir, "run_config.json"), 'w') as outfile:
+        json.dump(vars(args), outfile, indent=4)
+    '''
+    # get some random training images
+    dataiter = iter(train_loader)
+    _images, _labels = dataiter.next()
+    # create grid of images
+    img_grid = torchvision.utils.make_grid(_images)
+    # write to tensorboard
+    writer.add_image('sample_image', img_grid)
+    '''
+
     v_dict = None
     if args.snr:
-        v_dict = defaultdict()
-        for n,m in model.named_parameters():
-            if "bias" not in n:
-                v_dict[n] = torch.rand(m.size(0)).to(m.device)
+        v_dict = OrderedDict()
+        for n,m in model.named_modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)): #"bias" not in n and ".bn" not in n:
+                param_name = n + ".weight"
+                v_dict[param_name] = torch.rand(np.prod(m.weight.shape[1:])).to(m.weight.device)
+                v_dict[param_name] /= torch.norm(v_dict[param_name])
 
     if args.optim.lower() == "sgd":
         optimizer = torch.optim.SGD(model.parameters(), args.lr,
@@ -291,67 +339,72 @@ def main():
         #scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
         scheduler = ReduceLROnPlateau(optimizer, 'min')
 
-    for epoch in range(args.start_epoch, args.epochs):
-
-        if args.collect_activations:
-            layer_activations.clear()
-
-        # train for one epoch
-        prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch, v_dict)
-
-        # evaluate on validation set
-        prec1, loss_val = validate(val_loader, model, criterion, epoch)
-        # append loss and prec1 values
-        acc_train_list.append(prec1_train)
-        acc_val_list.append(prec1)
-        loss_train_list.append(loss_train)
-        loss_val_list.append(loss_val)
-
-        # remember best prec@1 and save checkpoint
-        is_best = prec1 > best_prec1
-        is_best_prev = prec1 > prev_prec
-
-        prev_prec = prec1
-        best_prec1 = max(prec1, best_prec1)
-        print(' * Best-Prec@1 {top1:.3f}'.format(top1=best_prec1))
-
-        if epoch >= epoch_interval  and epoch%10 == epoch_interval:
+    try:
+        for epoch in range(args.start_epoch, args.epochs):
+            writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
             if args.collect_activations:
-                plot_AS(epoch)
-            if args.stiffness:
-                plot_stiffness(epoch)
+                layer_activations.clear()
+            # train for one epoch
+            prec1_train, loss_train = train(train_loader, model, criterion, optimizer, epoch, v_dict)
+            # evaluate on validation set
+            prec1, loss_val = validate(val_loader, model, criterion, epoch)
+            # append loss and prec1 values
+            acc_train_list.append(prec1_train)
+            acc_val_list.append(prec1)
+            loss_train_list.append(loss_train)
+            loss_val_list.append(loss_val)
+
+            writer.add_scalar('loss/train',loss_train, epoch)
+            writer.add_scalar('loss/val', loss_val, epoch)
+            writer.add_scalar('accuracy/train', prec1_train, epoch)
+            writer.add_scalar('accuracy/val', prec1, epoch)
+            writer.flush()
+
+            # remember best prec@1 and save checkpoint
+            is_best = prec1 > best_prec1
+            is_best_prev = prec1 > prev_prec
+
+            prev_prec = prec1
+            best_prec1 = max(prec1, best_prec1)
+            print(' * Best-Prec@1 {top1:.3f}'.format(top1=best_prec1))
+
+            if epoch >= epoch_interval  and epoch%10 == epoch_interval:
+                if args.collect_activations:
+                    plot_AS(epoch)
+                if args.stiffness:
+                    plot_stiffness(epoch)
+
+            if args.collect_cosine:
+                if is_best:
+                    print("Cosine distances:")
+                param_keys, distances = model.get_cosine_distance_per_layer()
+                for idx, p_key in enumerate(param_keys):
+                    if is_best:
+                        print("    {0}:".format(p_key), distances[idx])
+                    distances_list[idx].append(distances[idx])
+
+            if is_best or epoch%15==0:
+               save_checkpoint({
+                   'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'best_prec1': best_prec1,
+                }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_{}.tar'.format(epoch)))
+
+            if args.patiance != 0:
+                early_stopping(loss_val, model)
+                if early_stopping.early_stop == True:
+                    break
+
+            if not args.constant_lr and args.optim.lower() == "sgd":
+                scheduler.step(loss_val)
+
+    finally:
+        writer.close()
+        plot_train_val_accs(acc_train_list, acc_val_list, best_prec1, accuracy_save_dir)
+        plot_loss(loss_train_list, loss_val_list, best_prec1, loss_save_dir)
 
         if args.collect_cosine:
-            if is_best:
-                print("Cosine distances:")
-            param_keys, distances = model.get_cosine_distance_per_layer()
-            for idx, p_key in enumerate(param_keys):
-                if is_best:
-                    print("    {0}:".format(p_key), distances[idx])
-                distances_list[idx].append(distances[idx])
-
-
-        if is_best or epoch%5==0:
-           save_checkpoint({
-               'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            }, is_best, filename=os.path.join(checkpoint_save_dir, 'checkpoint_{}.tar'.format(epoch)))
-
-        if args.patiance != 0:
-            early_stopping(loss_val, model)
-            if early_stopping.early_stop == True:
-                break
-
-        if not args.constant_lr and args.optim.lower() == "sgd":
-            scheduler.step(loss_val)
-
-    #timestamp = time.strftime("%Y%m%d-%H%M%S")
-    plot_train_val_accs(acc_train_list, acc_val_list, best_prec1, accuracy_save_dir)
-    plot_loss(loss_train_list, loss_val_list, best_prec1, loss_save_dir)
-
-    if args.collect_cosine:
-        plot_cosine_distances(param_keys, distances_list, timestamp)
+            plot_cosine_distances(param_keys, distances_list, timestamp)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, v_dict):
@@ -359,7 +412,7 @@ def train(train_loader, model, criterion, optimizer, epoch, v_dict):
         Run one train epoch
     """
 
-    global AS_val, epoch_interval
+    global AS_val, epoch_interval, writer
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -426,7 +479,8 @@ def train(train_loader, model, criterion, optimizer, epoch, v_dict):
         loss.backward()
 
         if args.snr:
-            regularize_spectral_norm(model, v_dict, args.alpha)
+            regularize_spectral_norm(model, v_dict, args.alpha, args.lambd, args.strength)
+
         #do the step
         optimizer.step()
         # measure accuracy and record loss

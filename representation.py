@@ -71,28 +71,6 @@ def _plot_helper(arr_x, arr_y, baseline_y,  xlabel, ylabel, save_path="svcca_def
     plt.grid()
     plt.savefig(save_path)
 
-def demo():
-    # Toy Example of CCA in action
-
-    # assume X_fake has 100 neurons and we have their activations on 1000 datapoints
-    A_fake = np.random.randn(100, 2000)
-    # Y_fake has 50 neurons with activations on the same 1000 datapoints
-    # Note X and Y do *not* have to have the same number of neurons
-    B_fake = np.random.randn(50, 2000)
-
-    # computing CCA simliarty between X_fake, Y_fake
-    # We expect similarity should be very low, because the fake activations are not correlated
-    results = cca_core.get_cca_similarity(A_fake, B_fake, verbose=True)
-
-    print("Returned Information:")
-    print(results.keys())
-    print("MEAN SVCCA:", np.mean(results["cca_coef1"]))
-
-    _plot_helper(list(range(len(results["cca_coef1"]))), results["cca_coef1"],
-                        results["cca_coef1"],"CCA coef idx", "CCA coef value", "cca_demo.png")
-
-
-
 def _configure_plot_axes(xlabel, ylabel, ylim=None):
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
@@ -572,7 +550,6 @@ def _get_RV_baseline(acts1, acts2):
     RV_coeff = nom / denum
     return RV_coeff
 
-
 def _get_linear_cka_baseline(acts1, acts2):
 
     a1shapes = [None, None]
@@ -917,7 +894,6 @@ def _get_abstraction_avg_pool(decomposition, acts, arch, param_name, epoch):
         #w_avg_abstractness += _abst * reduced_weights[i]
         total_abstractness += _abst
         abstractness_scatter.append(_abst)
-
 
     entropy_scatter = np.array(entropy_scatter)
     KLdiv_scatter = np.array(KLdiv_scatter)

@@ -4,33 +4,11 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy as np
 import pickle
+import sys
 
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-
-
-"""
-class JacobianRegularizerCrossEntropyLoss:
-    def __init__(self, reduction="mean", alpha=5e-2):
-        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
-        self.alpha = alpha
-
-    def __call__(self, output, target, model=None, input=None):
-        loss = self.cross_entropy(output, target)
-        if model == None and input == None:
-            return loss
-        dL_dx = torch.autograd.grad(loss, input, create_graph=True)[0]
-        return loss + 0.5 * self.alpha * ((dL_dx)**2).sum()
-
-    def cuda(self,):
-        self.cross_entropy.cuda()
-        return self
-
-    def cpu(self,):
-        self.cross_entropy.cpu()
-        return self
-"""
 
 class JacobianRegularizerCrossEntropyLoss:
     def __init__(self, reduction="mean", alpha=5e-2, _lambda=0.95):
@@ -69,6 +47,7 @@ class TransformSensitivityCrossEntropyLoss:
 
         assert sim_loss.lower() in ["mse", "cosine"], "{} is an undefined metric. Choose from ('mse', 'cosine')".format(sim_loss.lower())
         assert strength.lower() in ["increase", "decrease", "constant", "increase_exp"]
+
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
         self.is_cuda = False
         self.alpha = alpha
@@ -109,7 +88,6 @@ class TransformSensitivityCrossEntropyLoss:
                                                                 noisy_output[idx].view((out.shape[0], -1)),
                                                                 cosine_target
                                                                 )
-
         return ce_loss + self.alpha * noise_sensitivity_loss
 
     def cuda(self,):
@@ -123,12 +101,13 @@ class TransformSensitivityCrossEntropyLoss:
         return self
 
 class AdaptiveDecayCrossEntropyLoss:
-    def __init__(self, reduction="mean", alpha=1e-3, _lambda = 0.95, single_layer=False):
+    def __init__(self, reduction="mean", alpha=1e-3, _lambda = 0.95, strength="constant", blocks=4):
         self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
         self.is_cuda = False
+        self.strength = strength
         self.alpha = alpha
         self._lambda = _lambda
-        self.single_layer = single_layer
+        self.blocks = blocks
 
     def __call__(self, output, target, model=None):
         ce_loss = self.cross_entropy(output, target)
@@ -137,27 +116,36 @@ class AdaptiveDecayCrossEntropyLoss:
             return ce_loss
 
         norm_loss = 0.0
-        idx = sum([1 if hasattr(p, "weight") else 0 for (n,p) in model.named_parameters() ])
+        total_size = sum([1 if "bias" not in n else 0 for (n,p) in model.named_parameters()])
         prev_jacob = None
+        idx = 0
         for n, p in model.named_parameters():
-            if self._lambda != 0:
-                adaptive_ratio = self._lambda ** (idx)
-                if self.single_layer or "bias" in n:
-                    norm_loss += adaptive_ratio * (p**2).sum()
-                    idx -= 1
-                else:
-                    if prev_jacob != None:
-                        if len(p.shape) > 2:
-                            prev_jacob = torch.matmul(p.mean(dim=(2,3)), prev_jacob)
-                        else:
-                            prev_jacob = torch.matmul(p, prev_jacob)
-                    else:
-                        prev_jacob = p.mean(dim=(2,3))
-                    norm_loss += adaptive_ratio * (prev_jacob**2).sum()
-            # If lambda is 0, adaptive decay defaults to standart weight decay
-            else:
-                norm_loss += (p**2).sum()
+            # if self._lambda != 0:
 
+            if self.strength == "increase":
+                penalty_ratio = (idx//self.blocks + 1) / total_size
+            elif self.strength == "decrease":
+                penalty_ratio = 1 / (idx//self.blocks + 1)
+            elif self.strength == "constant":
+                penalty_ratio = 1
+            elif self.strength == "increase_exp":
+                penalty_ratio = self._lambda ** (total_size-idx-1)
+
+            if "bias" in n:
+                norm_loss += penalty_ratio * (p**2).sum()
+                idx += 1
+            else:
+                if prev_jacob != None:
+                    if len(p.shape) > 2:
+                        prev_jacob = torch.matmul(p.mean(dim=(2,3)), prev_jacob)
+                    else:
+                        prev_jacob = torch.matmul(p, prev_jacob)
+                else:
+                    prev_jacob = p.mean(dim=(2,3))
+                norm_loss += penalty_ratio * (prev_jacob**2).sum()
+            # If lambda is 0, adaptive decay defaults to standart weight decay
+            # else:
+            # norm_loss += (p**2).sum()
         return ce_loss + self.alpha * 0.5 * norm_loss
 
     def cuda(self,):
@@ -170,82 +158,48 @@ class AdaptiveDecayCrossEntropyLoss:
         self.is_cuda = False
         return self
 
-def regularize_spectral_norm(model, v_dict, alpha=0.001):
-    idx = sum([1 if hasattr(p, "weight") else 0 for (n,p) in model.named_parameters() ])
-    i = 0
+def regularize_spectral_norm(model, v_dict, alpha, _lambda, strength, blocks=4):
+    total_size = len(v_dict) #sum([1 if ("bias" not in n and ".bn" not in n) else 0 for (n,p) in model.named_parameters() ])
+    idx = 0
     for n, p in model.named_parameters():
-        if "bias" not in n:
+        if p.grad == None:
+            continue
+        flag = False
+        if n in v_dict:
             penalty, new_v = power_iteration(p, v_dict[n])
-            #print(n, torch.norm(p.grad), torch.norm(alpha*penalty))
-            p.grad += alpha * penalty / (i//5 + 1)
-            v_dict[n] = new_v
-            i += 1
+            v_dict[n] = new_v / torch.norm(new_v)
+            flag = True
+        #If param is not an instance of nn.Linear or nn.Conv2d, apply regular decay
+        else:
+            # TODO: Regular weight decay has a lower ratio. Adjust accordingly.
+            penalty = 5e-2 * p.data
+
+        if strength == "increase":
+            penalty_ratio = (idx//blocks + 1) / total_size
+        elif strength == "decrease":
+            penalty_ratio = 1 / (idx//blocks + 1)
+        elif strength == "constant":
+            penalty_ratio = 1
+        elif strength == "increase_exp":
+            penalty_ratio = _lambda ** (total_size-idx-1)
+
+        p.grad += alpha * penalty * penalty_ratio
+        if flag:
+            idx += 1
 
 def power_iteration(param, v):
     param_copy = param.clone().detach()
-    if len(param.shape) > 2:
-        param_copy = torch.flatten(param_copy, start_dim=1)
-    param_copy = param_copy.t()
     with torch.no_grad():
-        print(param.size(), param_copy.size(), v.size())
+        if len(param.shape) > 2:
+            param_copy = param_copy.view((param_copy.shape[0],-1))
+        #print(param.size(), param_copy.size(), v.size())
         u = torch.mv(param_copy, v)
         v = torch.mv(torch.transpose(param_copy, 0, 1), u)
         eig = torch.norm(u) / torch.norm(v)
-        uv_t = torch.matmul(u.unsqueeze(1), v.unsqueeze(1).t()).t()
+        uv_t = torch.matmul(u.unsqueeze(1), v.unsqueeze(1).t())
         if len(param.shape) > 2:
             uv_t = uv_t.view(param.size())
     return eig * uv_t, v
-
-"""
-class AdaptiveDecayCrossEntropyLoss:
-    def __init__(self, reduction="mean", alpha=1e-3, _lambda = 0.5):
-        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
-        self.is_cuda = False
-        self.alpha = alpha
-        self._lambda = _lambda
-
-    def __call__(self, output, target, model=None):
-        ce_loss = self.cross_entropy(output, target)
-
-        if model == None:
-            return ce_loss
-
-        norm_loss = 0.0
-        idx = sum([1 if hasattr(p, "weight") else 0 for (n,p) in model.named_parameters() ])
-        prev_jacob = None
-        norm_product = 1.0
-        for n, p in model.named_parameters():
-            if self._lambda != 0 and "bias" not in n:
-                adaptive_ratio = self._lambda ** (idx)
-                if prev_jacob != None:
-                    if len(p.shape) > 2:
-                        prev_jacob = F.conv2d(prev_jacob.unsqueeze(0), p, padding=1).squeeze(0)
-                    else:
-                        if len(prev_jacob.shape) > 2:
-                            pool_size = int((prev_jacob.numel() / p.size(1))**0.5)
-                            prev_jacob = torch.matmul(p, F.max_pool2d(prev_jacob.unsqueeze(0), pool_size).squeeze(0).flatten(start_dim=1))
-                        else:
-                            prev_jacob = torch.matmul(p, prev_jacob)
-                else:
-                    prev_jacob = F.conv2d(torch.ones((1,3,32,32)).to(p.device), p, padding=1).squeeze(0)
-                norm_loss += adaptive_ratio * ((prev_jacob*prev_jacob).sum()**0.5)
-                idx -= 1
-            # If lambda is 0, adaptive decay defaults to standart weight decay
-            else:
-                norm_loss += (p*p).sum()
-
-        return ce_loss + self.alpha * norm_loss
-
-    def cuda(self,):
-        self.cross_entropy.cuda()
-        self.is_cuda = True
-        return self
-
-    def cpu(self,):
-        self.cross_entropy.cpu()
-        self.is_cuda = False
-        return self
-"""
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
@@ -325,17 +279,20 @@ class AverageMeter(object):
         self.avg[self.avg>0.1] = 1.0
         self.avg = F.softmax(self.avg, dim=1)
 
-def get_train_loader_CIFAR10(batch_size, workers, label_noise=False):
+def get_train_loader_CIFAR10(batch_size, workers, label_noise=False, resize=None):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
 
-    _transforms = transforms.Compose([
-                   transforms.RandomHorizontalFlip(),
-                   transforms.RandomCrop(32, 4),
-                   transforms.ToTensor(),
-                   normalize,
-               ])
+    _transforms  = [transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(resize if resize else 32, 4),
+        transforms.ToTensor(),
+        normalize
+    ]
 
+    if resize:
+        _transforms.insert(0, transforms.Resize(resize))
+
+    _transforms = transforms.Compose(_transforms)
     train_set = datasets.CIFAR10(root='./data', train=True, transform=_transforms, download=True)
 
     if label_noise > 0:
@@ -354,21 +311,20 @@ def get_train_loader_CIFAR10(batch_size, workers, label_noise=False):
         num_workers=workers, pin_memory=True, sampler=train_sampler)
     return train_loader
 
-def get_val_loader_CIFAR10(batch_size, workers, noise_sigma):
+def get_val_loader_CIFAR10(batch_size, workers, resize=None):
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
 
-    if noise_sigma:
-        _transforms_val = transforms.Compose([
-                                transforms.ToTensor(),
-                                normalize,
-                                AddGaussianNoise(0., sigma),
-                            ])
-    else:
-        _transforms_val = transforms.Compose([
-                                transforms.ToTensor(),
-                                normalize,
-                            ])
+    _transforms_val = [transforms.ToTensor(),
+                        normalize
+                    ]
+
+    if resize:
+        _transforms_val.insert(0, transforms.Resize(resize))
+    #if noise_sigma:
+    #    _transforms_val.append(AddGaussianNoise(0, noise_sigma))
+
+    _transforms_val = transforms.Compose(_transforms_val)
 
     val_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=False, transform=_transforms_val, download=True),
@@ -376,18 +332,20 @@ def get_val_loader_CIFAR10(batch_size, workers, noise_sigma):
                         num_workers=workers, pin_memory=True)
     return val_loader
 
-def get_train_loader_CIFAR100(batch_size, workers, label_noise=0):
+def get_train_loader_CIFAR100(batch_size, workers, label_noise=0, resize=None):
     mean = [0.5070751592371323, 0.48654887331495095, 0.4409178433670343]
     std = [0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
-    transform_train = transforms.Compose([
+    transform_train = [
         #transforms.ToPILImage(),
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(resize if resize else 32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(15),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
-    ])
-
+    ]
+    if resize:
+        transform_train.insert(0, transforms.Resize(resize))
+    transform_train = transforms.Compose(transform_train)
     train_set = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
 
     if label_noise > 0:
@@ -406,30 +364,27 @@ def get_train_loader_CIFAR100(batch_size, workers, label_noise=0):
         num_workers=workers, pin_memory=True, sampler=train_sampler)
     return train_loader
 
-def get_val_loader_CIFAR100(batch_size, workers, noise_sigma=0):
+def get_val_loader_CIFAR100(batch_size, workers, resize=None):
     mean = [0.5070751592371323, 0.48654887331495095, 0.4409178433670343]
     std = [0.2673342858792401, 0.2564384629170883, 0.27615047132568404]
-    if noise_sigma:
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-            AddGaussianNoise(0., noise_sigma)
-        ])
-    else:
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std)
-        ])
+
+    transform_test = [
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std)
+    ]
+
+    if resize:
+        transform_test.insert(0, transforms.Resize(resize))
+
+    transform_test = transforms.Compose(transform_test)
     val_set = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
     val_loader = torch.utils.data.DataLoader(
         val_set, shuffle=False, num_workers=workers, batch_size=batch_size)
     return val_loader
 
-
 def add_gaussian_noise(tensor, mean = 0.0, std=0.1):
     std_in_ratio = torch.norm(tensor, dim=(2,3), keepdim=True) * std
     return tensor + torch.randn(tensor.size()).to(std_in_ratio.device) * std_in_ratio  + mean
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -477,3 +432,76 @@ def threshold_gradient_stiffness(similarity, threshold=0.05, steepness=0.25):
     if similarity < threshold + 1e-5:
         return 1e-5
     return np.exp(((similarity-threshold)**2)/steepness)
+
+"""
+class AdaptiveDecayCrossEntropyLoss:
+    def __init__(self, reduction="mean", alpha=1e-3, _lambda = 0.5):
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
+        self.is_cuda = False
+        self.alpha = alpha
+        self._lambda = _lambda
+
+    def __call__(self, output, target, model=None):
+        ce_loss = self.cross_entropy(output, target)
+
+        if model == None:
+            return ce_loss
+
+        norm_loss = 0.0
+        idx = sum([1 if hasattr(p, "weight") else 0 for (n,p) in model.named_parameters() ])
+        prev_jacob = None
+        norm_product = 1.0
+        for n, p in model.named_parameters():
+            if self._lambda != 0 and "bias" not in n:
+                adaptive_ratio = self._lambda ** (idx)
+                if prev_jacob != None:
+                    if len(p.shape) > 2:
+                        prev_jacob = F.conv2d(prev_jacob.unsqueeze(0), p, padding=1).squeeze(0)
+                    else:
+                        if len(prev_jacob.shape) > 2:
+                            pool_size = int((prev_jacob.numel() / p.size(1))**0.5)
+                            prev_jacob = torch.matmul(p, F.max_pool2d(prev_jacob.unsqueeze(0), pool_size).squeeze(0).flatten(start_dim=1))
+                        else:
+                            prev_jacob = torch.matmul(p, prev_jacob)
+                else:
+                    prev_jacob = F.conv2d(torch.ones((1,3,32,32)).to(p.device), p, padding=1).squeeze(0)
+                norm_loss += adaptive_ratio * ((prev_jacob*prev_jacob).sum()**0.5)
+                idx -= 1
+            # If lambda is 0, adaptive decay defaults to standart weight decay
+            else:
+                norm_loss += (p*p).sum()
+
+        return ce_loss + self.alpha * norm_loss
+
+    def cuda(self,):
+        self.cross_entropy.cuda()
+        self.is_cuda = True
+        return self
+
+    def cpu(self,):
+        self.cross_entropy.cpu()
+        self.is_cuda = False
+        return self
+"""
+
+"""
+class JacobianRegularizerCrossEntropyLoss:
+    def __init__(self, reduction="mean", alpha=5e-2):
+        self.cross_entropy = torch.nn.CrossEntropyLoss(reduction=reduction)
+        self.alpha = alpha
+
+    def __call__(self, output, target, model=None, input=None):
+        loss = self.cross_entropy(output, target)
+        if model == None and input == None:
+            return loss
+        dL_dx = torch.autograd.grad(loss, input, create_graph=True)[0]
+        return loss + 0.5 * self.alpha * ((dL_dx)**2).sum()
+
+    def cuda(self,):
+        self.cross_entropy.cuda()
+        return self
+
+    def cpu(self,):
+        self.cross_entropy.cpu()
+        return self
+"""
