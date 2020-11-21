@@ -12,7 +12,7 @@ from collections import defaultdict
 import time
 from scipy.stats import entropy as entropy_scipy
 from scipy.stats import skewnorm, gaussian_kde
-import entropy_estimators
+from entropy import entropy_estimators
 
 import torch
 import torch.nn.functional as F
@@ -20,9 +20,9 @@ import torch.nn.functional as F
 sys.path.append("svcca")
 import cca_core
 import pwcca
-import models
-from utils import *
-from autograd_hacks import is_supported
+from model import models
+from model.utils import *
+from model.autograd_hacks import is_supported
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")

@@ -29,10 +29,10 @@ from torch.utils.tensorboard import SummaryWriter
 #import torchvision.transforms as transforms
 #import torchvision.datasets as datasets
 
-import models
-from autograd_hacks import *
-from utils import *
-from representation import _get_pwcca_avg_pool, _get_pwcca_baseline, _get_RV_avg_pool, _get_RV_baseline, _get_linear_cka_baseline, _get_linear_cka_avg_pool
+from model import models
+from model.autograd_hacks import *
+from model.utils import *
+from representation import *
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")

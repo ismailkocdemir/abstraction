@@ -7,7 +7,7 @@ import matplotlib as mpl
 import numpy as np
 import weightwatcher as ww
 import torchvision.models as torch_models
-import models
+from model import models
 
 parser = argparse.ArgumentParser(description='Weight Analysis')
 
